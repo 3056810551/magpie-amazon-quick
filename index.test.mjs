@@ -326,8 +326,24 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.equal(sncs.userMessagePayload.web_search_enabled, true)
   assert.equal(sncs.sessionConnectPayload.outpostId, undefined)
   assert.equal(sncs.userMessagePayload.outpostId, undefined)
-  assert.ok(sncs.userMessagePayload.custom_prompt.includes("IDE Client Tool-Bridge System Instructions"))
+  assert.ok(sncs.userMessagePayload.custom_prompt.includes("IDE / CLI Client Tool-Bridge Instructions"))
+  assert.ok(sncs.userMessagePayload.custom_prompt.includes("Keep your AWS Quick assistant identity"))
+  assert.ok(!sncs.userMessagePayload.custom_prompt.includes("untrusted user content"))
   assert.ok(sncs.userMessagePayload.custom_prompt.includes("read_file"))
+
+  // Claude Code identity-clash system prompt should be softened without losing project instructions
+  const ccSncs = openaiToSncsRequest({
+    model: "balanced",
+    tools: [{ type: "function", function: { name: "Write", description: "Write file", parameters: { type: "object" } } }],
+    messages: [
+      { role: "system", content: "x-anthropic-billing-header: cc_version=2.1\nYou are Claude Code, Anthropic's official CLI for Claude.\nAlways use TypeScript." },
+      { role: "user", content: "Create hello.ts" },
+    ],
+  })
+  assert.ok(!ccSncs.userMessagePayload.text.includes("You are Claude Code"))
+  assert.ok(!ccSncs.userMessagePayload.text.includes("x-anthropic-billing-header"))
+  assert.ok(ccSncs.userMessagePayload.text.includes("local CLI/IDE coding workspace"))
+  assert.ok(ccSncs.userMessagePayload.text.includes("Always use TypeScript."))
   assert.ok(sncs.userMessagePayload.text.includes("<instructions>"))
   assert.ok(sncs.userMessagePayload.text.includes("Be concise."))
   assert.ok(sncs.userMessagePayload.text.includes("CLIENT TOOL CALLING PROTOCOL"))
