@@ -327,6 +327,8 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.ok(sncs.userMessagePayload.text.includes("Be concise."))
   assert.ok(sncs.userMessagePayload.text.includes("CLIENT TOOL CALLING PROTOCOL"))
   assert.ok(sncs.userMessagePayload.text.includes('<tool_result id="c1">\nhello\n</tool_result>'))
+  assert.ok(sncs.userMessagePayload.text.endsWith("</client_tool_directive>"))
+  assert.ok(sncs.userMessagePayload.text.includes("Available client tool names: read_file."))
 
   const sncsNoWeb = openaiToSncsRequest(
     { model: "fast", web_search_enabled: false, messages: [{ role: "user", content: "Ping" }] },
