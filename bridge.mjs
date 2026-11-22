@@ -11,6 +11,7 @@ import {
   hostFromUrl,
   isGatewayProvider,
   surfaceTypeForPlatform,
+  uploadQuickAttachment,
 } from "./credentials.mjs"
 
 export const DEFAULT_API_URL = "https://quick.aws.com/v1"
@@ -105,9 +106,9 @@ export function buildProviderModelEntry(providerID, spec, baseURL = DEFAULT_API_
   const cap = {
     temperature: true,
     reasoning: !!spec.reasoning,
-    attachment: false,
+    attachment: true,
     toolcall: true,
-    input: { text: true, audio: false, image: false, video: false, pdf: false },
+    input: { text: true, audio: false, image: true, video: false, pdf: false },
     output: { text: true, audio: false, image: false, video: false, pdf: false },
     interleaved: false,
   }
@@ -227,16 +228,70 @@ export function resolveModelAndEffort(requestedModel, body = {}) {
   }
 }
 
-function textFromContent(content) {
+function textFromContent(content, includeImagePlaceholder = true) {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return content == null ? "" : String(content)
   const parts = []
   for (const part of content) {
     if (!part || typeof part !== "object") continue
     if (part.type === "text" || part.type === "input_text") parts.push(String(part.text ?? ""))
-    else if (part.type === "image_url") parts.push("[Image attachment omitted]")
+    else if (part.type === "image_url" && includeImagePlaceholder) {
+      parts.push("[Image attachment]")
+    }
   }
   return parts.join("\n")
+}
+
+function digestContent(content) {
+  if (typeof content === "string") return content.trim()
+  if (!Array.isArray(content)) return content == null ? "" : String(content).trim()
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return ""
+      if (part.type === "text" || part.type === "input_text") return String(part.text ?? "")
+      if (part.type === "image_url") {
+        const u = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
+        return `[image:${sha256Hex(u || "")}]`
+      }
+      return ""
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim()
+}
+
+function collectImageUrls(msgs) {
+  const urls = []
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    if (!Array.isArray(m?.content)) continue
+    for (const part of m.content) {
+      if (part?.type !== "image_url") continue
+      const u = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
+      if (typeof u === "string" && u.trim()) urls.push(u.trim())
+    }
+  }
+  return urls
+}
+
+async function resolveImageBytes(urlStr, fetchImpl, signal) {
+  if (urlStr.startsWith("data:")) {
+    const m = urlStr.match(/^data:([^;,]+)?(?:;base64)?,([\s\S]*)$/i)
+    if (!m) return null
+    const mimeType = (m[1] || "image/png").toLowerCase()
+    const isB64 = /;base64,/i.test(urlStr)
+    const bytes = isB64 ? Buffer.from(m[2], "base64") : Buffer.from(decodeURIComponent(m[2]), "utf8")
+    const ext = mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "png"
+    return { mimeType, bytes, ext }
+  }
+  if (/^https?:\/\//i.test(urlStr)) {
+    const res = await fetchImpl(urlStr, { signal: signal ?? AbortSignal.timeout(15000) })
+    if (!res.ok) return null
+    const buf = new Uint8Array(await res.arrayBuffer())
+    const mimeType = (res.headers.get("content-type") || "image/png").split(";")[0].trim().toLowerCase()
+    const ext = mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "png"
+    return { mimeType, bytes: buf, ext }
+  }
+  return null
 }
 
 export const MAX_USER_MESSAGE_FRAME_BYTES = 58_000
@@ -364,20 +419,38 @@ export function accountKeyOf(a) {
 
 function messageDigest(msg) {
   const role = String(msg?.role || "user").toLowerCase()
-  const text = textFromContent(msg?.content).trim()
+  const text = digestContent(msg?.content)
   const calls = role === "assistant" ? normalizeToolCallsForDigest(msg?.tool_calls) : []
   const callId = role === "tool" ? String(msg?.tool_call_id || msg?.name || "") : ""
   return sha256Hex(JSON.stringify([role, text, calls, callId]))
 }
 
-function envDigest(systemParts, tools, toolChoice) {
+function toolsDigest(tools, toolChoice) {
   const toolSig = (Array.isArray(tools) ? tools : [])
     .map((t) => {
       const fn = t?.function ?? t
       return fn?.name ? [fn.name, fn.description || "", canonicalJson(fn.parameters ?? {})] : null
     })
     .filter(Boolean)
-  return sha256Hex(JSON.stringify([systemParts, toolSig, toolChoice ?? null]))
+  return sha256Hex(JSON.stringify([toolSig, toolChoice ?? null]))
+}
+
+function systemDeltaText(prevSys, nextSys, maxDiffChars = 6000) {
+  if (prevSys === nextSys) return ""
+  if (!prevSys) return nextSys.length <= maxDiffChars ? nextSys : null
+  const a = prevSys.split(/\r?\n/)
+  const b = nextSys.split(/\r?\n/)
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length - 1
+  let endB = b.length - 1
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA--
+    endB--
+  }
+  const changed = b.slice(start, endB + 1).join("\n").trim()
+  if (!changed) return ""
+  return changed.length <= maxDiffChars ? changed : null
 }
 
 function formatConvoBlocks(msgs) {
@@ -444,17 +517,17 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
   }
 
   return {
-    lookup(accountKey, sessionId, envSig, convoMessages) {
+    lookup(accountKey, sessionId, toolsSig, nextSysText, convoMessages) {
       if (!Array.isArray(convoMessages) || convoMessages.length < 2) return null
       const hashes = convoMessages.map(messageDigest)
       const candidates = []
       if (sessionId) candidates.push(`sess:${accountKey}|${sessionId}`)
-      candidates.push(`head:${accountKey}|${envSig}|${hashes[0]}`)
+      candidates.push(`head:${accountKey}|${toolsSig}|${hashes[0]}`)
 
       for (const k of candidates) {
         const entry = touch(k)
         if (!entry) continue
-        if (entry.accountKey !== accountKey || entry.envSig !== envSig) continue
+        if (entry.accountKey !== accountKey || entry.toolsSig !== toolsSig) continue
         const prefixLen = entry.msgHashes.length
         if (convoMessages.length < prefixLen + 2) continue
         let prefixOk = true
@@ -468,13 +541,16 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         const replyMsg = convoMessages[prefixLen]
         if (String(replyMsg?.role || "").toLowerCase() !== "assistant") continue
         if (entry.expectedAssistantSig && hashes[prefixLen] !== entry.expectedAssistantSig) continue
+        const systemUpdate = systemDeltaText(entry.sysText || "", nextSysText || "")
+        if (systemUpdate === null) continue
         return {
           key: k,
           threadId: entry.threadId,
           workingSessionId: entry.workingSessionId,
           deltaMessages: convoMessages.slice(prefixLen + 1),
+          systemUpdate,
           allHashes: hashes,
-          envSig,
+          toolsSig,
         }
       }
       return null
@@ -488,7 +564,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         byKey.set(sk, record)
       }
       if (record.msgHashes?.length) {
-        const hk = `head:${accountKey}|${record.envSig}|${record.msgHashes[0]}`
+        const hk = `head:${accountKey}|${record.toolsSig}|${record.msgHashes[0]}`
         byKey.delete(hk)
         byKey.set(hk, record)
       }
@@ -536,7 +612,8 @@ export function openaiToSncsRequest(body, opts = {}) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
   const toolChoice = body?.tool_choice
   const hasTools = tools.length > 0 && toolChoice !== "none"
-  const envSig = envDigest(rawSystemParts, hasTools ? tools : [], toolChoice)
+  const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
+  const rawSystemText = rawSystemParts.join("\n\n")
   const convoHashes = convoMessages.map(messageDigest)
 
   const resumeState = opts.resumeState || null
@@ -565,6 +642,9 @@ export function openaiToSncsRequest(body, opts = {}) {
     const bodyText = blocks.filter(Boolean).join("\n\n")
     const parts = []
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
+    if (isResume && resumeState.systemUpdate) {
+      parts.push(`<system_context_update>\n${resumeState.systemUpdate}\n</system_context_update>`)
+    }
     if (bodyText) parts.push(bodyText)
     if (trailing) parts.push(trailing)
     return parts.join("\n\n")
@@ -630,9 +710,11 @@ export function openaiToSncsRequest(body, opts = {}) {
   }
 
   // Stage 4: Final safety clamp on user body text so outbound frame stays under maxFrameBytes
+  let overflowUserText = ""
   if (measure(text) > maxFrameBytes && blocks.length) {
+    overflowUserText = blocks[blocks.length - 1]
     let over = measure(text) - maxFrameBytes
-    let last = blocks[blocks.length - 1]
+    let last = overflowUserText
     while (over > 0 && last.length > 256) {
       const cut = Math.max(200, Math.floor(over * 0.75))
       last = truncateMiddle(last, Math.max(128, last.length - cut))
@@ -642,12 +724,17 @@ export function openaiToSncsRequest(body, opts = {}) {
     }
   }
 
+  const outboundMsgs = isResume ? resumeState.deltaMessages : convoMessages
+
   return {
     modelId,
     hasTools,
     isResume,
-    envSig,
+    toolsSig,
+    rawSystemText,
     convoHashes,
+    imageUrls: collectImageUrls(outboundMsgs),
+    overflowUserText,
     stream: body?.stream === true,
     outpostId,
     workingSessionId,
@@ -904,10 +991,24 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
 
   let resumeState = null
   if (stateful) {
-    const probe = openaiToSncsRequest(openaiBody, { ...opts, disableResume: true })
     const rawMessages = Array.isArray(openaiBody?.messages) ? openaiBody.messages : []
-    const convo = rawMessages.filter((m) => m && typeof m === "object" && !["system", "developer"].includes(String(m.role || "user").toLowerCase()))
-    resumeState = threadStore.lookup(accountKey, opts.sessionId || "", probe.envSig, convo)
+    const sysParts = []
+    const convo = []
+    for (const m of rawMessages) {
+      if (!m || typeof m !== "object") continue
+      const r = String(m.role || "user").toLowerCase()
+      if (r === "system" || r === "developer") {
+        const t = textFromContent(m.content).trim()
+        if (t) sysParts.push(t)
+      } else {
+        convo.push(m)
+      }
+    }
+    const tools = Array.isArray(openaiBody?.tools) ? openaiBody.tools : []
+    const toolChoice = openaiBody?.tool_choice
+    const hasTools = tools.length > 0 && toolChoice !== "none"
+    const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
+    resumeState = threadStore.lookup(accountKey, opts.sessionId || "", toolsSig, sysParts.join("\n\n"), convo)
   }
 
   try {
@@ -921,12 +1022,83 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   }
 }
 
-function runSncsTurn(a, openaiBody, ctx) {
+function serializeWireAttachment(att) {
+  return {
+    type: att.type,
+    name: att.name,
+    size: att.size,
+    mimeType: att.mimeType,
+    path: att.path,
+    attachmentId: att.attachmentId,
+    contentSha256: att.contentSha256,
+  }
+}
+
+async function prepareTurnAttachments(a, reqPlan, opts) {
+  if (opts.disableAttachments) return []
+  const hasImages = Array.isArray(reqPlan.imageUrls) && reqPlan.imageUrls.length > 0
+  const hasOverflow = Boolean(reqPlan.overflowUserText) && opts.uploadLargeText !== false
+  if (!hasImages && !hasOverflow) return []
+
+  const uploader = opts.uploadAttachment ?? uploadQuickAttachment
+  const fetchImpl = opts.fetch ?? fetch
+  const tasks = []
+
+  if (hasImages) {
+    reqPlan.imageUrls.forEach((url, idx) => {
+      tasks.push(
+        (async () => {
+          const img = await resolveImageBytes(url, fetchImpl, opts.signal)
+          if (!img?.bytes?.byteLength) return null
+          const name = `image_${String(idx + 1).padStart(3, "0")}.${img.ext}`
+          const uploaded = await uploader(
+            a,
+            { name, mimeType: img.mimeType, bytes: img.bytes, threadId: reqPlan.threadId },
+            opts,
+          )
+          return serializeWireAttachment(uploaded)
+        })(),
+      )
+    })
+  }
+
+  if (hasOverflow) {
+    tasks.push(
+      (async () => {
+        const bytes = Buffer.from(reqPlan.overflowUserText, "utf8")
+        const uploaded = await uploader(
+          a,
+          { name: "prompt_context.txt", mimeType: "text/plain; charset=utf-8", bytes, threadId: reqPlan.threadId },
+          opts,
+        )
+        return serializeWireAttachment(uploaded)
+      })(),
+    )
+  }
+
+  const settled = await Promise.allSettled(tasks)
+  const attachments = []
+  for (const r of settled) {
+    if (r.status === "fulfilled" && r.value) {
+      attachments.push(r.value)
+    } else if (r.status === "rejected" && r.reason?.status === 401) {
+      throw r.reason
+    }
+  }
+  return attachments
+}
+
+async function runSncsTurn(a, openaiBody, ctx) {
   const { WS, accountKey, threadStore, ...opts } = ctx
   const gateway = isGatewayProvider(a.providerType)
   const reqPlan = openaiToSncsRequest(openaiBody, opts)
   const wsHost = a.wsHost || hostFromUrl(a.tenantUrl)
   if (!wsHost) throw new Error("Missing Amazon Quick wsHost / tenantUrl")
+
+  const attachments = await prepareTurnAttachments(a, reqPlan, opts)
+  if (attachments.length) {
+    reqPlan.userMessagePayload.attachments = attachments
+  }
 
   const surface = surfaceTypeForPlatform(opts.platform)
   const encodeOutbound = gateway ? buildGatewayInputFrame : buildAidpInputFrame
@@ -963,20 +1135,35 @@ function runSncsTurn(a, openaiBody, ctx) {
     let handshakeReady = false
     let finished = false
     let pingTimer = null
+    let connectTimer = null
+    let idleTimer = null
     let rxBuffer = new Uint8Array(0)
     let accumulatedContent = ""
     let accumulatedReasoning = ""
+    let sawTextDelta = false
     let usageInfo = null
     let sseController = null
     let settledInitial = false
+    const chunkBuffers = new Map()
     const splitter = createToolCallSplitter(reqPlan.hasTools, openaiBody?.tools)
     const sseEnc = new TextEncoder()
+    const connectTimeoutMs = Number(opts.connectTimeoutMs) > 0 ? Number(opts.connectTimeoutMs) : 15_000
+    const idleTimeoutMs = Number(opts.idleTimeoutMs) > 0 ? Number(opts.idleTimeoutMs) : 90_000
 
     const cleanup = () => {
       if (pingTimer) {
         clearInterval(pingTimer)
         pingTimer = null
       }
+      if (connectTimer) {
+        clearTimeout(connectTimer)
+        connectTimer = null
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = null
+      }
+      chunkBuffers.clear()
       if (opts.signal && onAbort) {
         opts.signal.removeEventListener("abort", onAbort)
       }
@@ -984,6 +1171,20 @@ function runSncsTurn(a, openaiBody, ctx) {
         if (ws.readyState === 0 || ws.readyState === 1) ws.close(1000, "done")
       } catch {}
     }
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      if (finished) return
+      idleTimer = setTimeout(() => {
+        failEarly("Amazon Quick WebSocket response timed out", 504)
+      }, idleTimeoutMs)
+      idleTimer.unref?.()
+    }
+
+    connectTimer = setTimeout(() => {
+      failEarly("Amazon Quick WebSocket connection timed out", 504)
+    }, connectTimeoutMs)
+    connectTimer.unref?.()
 
     const emitSse = (obj) => {
       if (!sseController) return
@@ -1030,7 +1231,8 @@ function runSncsTurn(a, openaiBody, ctx) {
       threadStore.commit(accountKey, opts.sessionId || "", {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
-        envSig: reqPlan.envSig,
+        toolsSig: reqPlan.toolsSig,
+        sysText: reqPlan.rawSystemText,
         msgHashes: reqPlan.convoHashes,
         expectedAssistantSig,
       })
@@ -1139,9 +1341,49 @@ function runSncsTurn(a, openaiBody, ctx) {
       opts.signal.addEventListener("abort", onAbort, { once: true })
     }
 
+    const emitParsedText = (chunkText) => {
+      if (!chunkText) return
+      const out = splitter.push(chunkText)
+      if (out.text) {
+        accumulatedContent += out.text
+        if (reqPlan.stream) emitDeltaChunk({ content: out.text })
+      }
+      if (reqPlan.stream) {
+        for (const tc of out.toolCalls) emitDeltaChunk({ tool_calls: [tc] })
+      }
+    }
+
+    const handleChunkedFrame = (ev) => {
+      const p = ev.payload ?? ev
+      const chunkId = typeof p?.chunk_id === "string" ? p.chunk_id : ""
+      const idx = Number(p?.chunk_index)
+      const total = Number(p?.total_chunks)
+      const data = typeof p?.data === "string" ? p.data : ""
+      if (!chunkId || !Number.isInteger(idx) || !Number.isInteger(total) || total <= 0 || total > 512 || idx < 0 || idx >= total) {
+        return
+      }
+      let entry = chunkBuffers.get(chunkId)
+      if (!entry || entry.total !== total) {
+        entry = { chunks: new Array(total).fill(null), received: 0, total }
+        chunkBuffers.set(chunkId, entry)
+      }
+      if (entry.chunks[idx] === null) entry.received++
+      entry.chunks[idx] = data
+      if (entry.received === total) {
+        chunkBuffers.delete(chunkId)
+        try {
+          handleSncsEvent(JSON.parse(entry.chunks.join("")))
+        } catch {}
+      }
+    }
+
     const handleSncsEvent = (ev) => {
       if (!ev || typeof ev !== "object") return
       const type = ev.type
+      if (type === "_chunked_frame") {
+        handleChunkedFrame(ev)
+        return
+      }
       if (type === "keepalive" || type === "pong") return
       if (type === "session_established" || type === "connected") {
         handshakeReady = true
@@ -1177,29 +1419,15 @@ function runSncsTurn(a, openaiBody, ctx) {
       if (type === "text_delta") {
         const d = ev.payload?.delta ?? ""
         if (d) {
-          const out = splitter.push(d)
-          if (out.text) {
-            accumulatedContent += out.text
-            if (reqPlan.stream) emitDeltaChunk({ content: out.text })
-          }
-          if (reqPlan.stream) {
-            for (const tc of out.toolCalls) emitDeltaChunk({ tool_calls: [tc] })
-          }
+          sawTextDelta = true
+          emitParsedText(d)
         }
         return
       }
       if (type === "text_complete") {
-        // Fallback if text_delta wasn't streamed
         const full = ev.payload?.text
-        if (typeof full === "string" && !accumulatedContent && !splitter.calls.length && full) {
-          const out = splitter.push(full)
-          if (out.text) {
-            accumulatedContent += out.text
-            if (reqPlan.stream) emitDeltaChunk({ content: out.text })
-          }
-          if (reqPlan.stream) {
-            for (const tc of out.toolCalls) emitDeltaChunk({ tool_calls: [tc] })
-          }
+        if (typeof full === "string" && !sawTextDelta && full) {
+          emitParsedText(full)
         }
         return
       }
@@ -1226,6 +1454,11 @@ function runSncsTurn(a, openaiBody, ctx) {
 
     ws.onopen = () => {
       if (finished) return
+      if (connectTimer) {
+        clearTimeout(connectTimer)
+        connectTimer = null
+      }
+      resetIdleTimer()
       ws.send(encodeOutbound({ type: "session_connect", payload: reqPlan.sessionConnectPayload }))
       ws.send(encodeOutbound({ type: "user_message", payload: reqPlan.userMessagePayload }))
       pingTimer = setInterval(() => {
@@ -1240,6 +1473,7 @@ function runSncsTurn(a, openaiBody, ctx) {
 
     ws.onmessage = (ev) => {
       if (finished) return
+      resetIdleTimer()
       const data = ev.data
       if (typeof data === "string") {
         try {

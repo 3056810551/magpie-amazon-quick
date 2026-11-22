@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 import { createServer } from "node:http"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -106,6 +106,10 @@ export function hostFromUrl(url) {
 }
 
 export function toMs(ts, fallback = 0) {
+  if (typeof ts === "string" && ts.trim() && !/^\d+(\.\d+)?$/.test(ts.trim())) {
+    const parsed = Date.parse(ts)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+  }
   const n = Number(ts)
   if (!Number.isFinite(n) || n <= 0) return fallback
   // Seconds (< 1e12) vs milliseconds (>= 1e12)
@@ -263,10 +267,18 @@ export function normalizeAuth(cred, profile = null, source = "") {
   }
 }
 
-let desktopCache = { at: 0, key: "", value: null }
+let desktopCache = { at: 0, key: "", mtimeMs: -1, value: null }
 
 export function clearDesktopCache() {
-  desktopCache = { at: 0, key: "", value: null }
+  desktopCache = { at: 0, key: "", mtimeMs: -1, value: null }
+}
+
+function fileMtimeMs(path, statImpl = statSync) {
+  try {
+    return Number(statImpl(path)?.mtimeMs) || 0
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -275,9 +287,22 @@ export function clearDesktopCache() {
  */
 export function readDesktop(opts = {}) {
   const now = opts.now ?? Date.now()
-  const key = `${opts.profileId || ""}|${opts.dir || ""}`
-  if (!opts.noCache && desktopCache.value && desktopCache.key === key && now - desktopCache.at < DESKTOP_CACHE_MS) {
-    return desktopCache.value
+  const dir = opts.dir ?? quickworkDir(opts.env, opts.home)
+  const profilesFile = join(dir, "profiles.json")
+  const mtimeMs = opts.readFileSync ? -1 : fileMtimeMs(profilesFile, opts.statSync)
+  const key = `${opts.profileId || ""}|${dir}|${opts.readKeyring ? "mock" : "os"}`
+  if (!opts.noCache && desktopCache.value && desktopCache.key === key) {
+    const withinShortTtl = now - desktopCache.at < DESKTOP_CACHE_MS
+    const osTokenStillFresh =
+      !opts.readKeyring &&
+      !opts.readFileSync &&
+      mtimeMs > 0 &&
+      mtimeMs === desktopCache.mtimeMs &&
+      desktopCache.value.expires > 0 &&
+      desktopCache.value.expires - REFRESH_LEAD_MS > now
+    if (withinShortTtl || osTokenStillFresh) {
+      return desktopCache.value
+    }
   }
   const profiles = readDesktopProfiles(opts)
   const profile = selectDesktopProfile(profiles, opts.profileId)
@@ -298,7 +323,7 @@ export function readDesktop(opts = {}) {
   }
   const auth = normalizeAuth(parsed, profile, "desktop")
   if (!auth.access || !auth.tenantUrl) return null
-  if (!opts.noCache) desktopCache = { at: now, key, value: auth }
+  if (!opts.noCache) desktopCache = { at: now, key, mtimeMs, value: auth }
   return auth
 }
 
@@ -615,23 +640,38 @@ export async function browserSignIn(inputs = {}, opts = {}) {
     server.once("error", reject)
     server.listen(0, "127.0.0.1", () => resolve())
   })
+  server.unref?.()
+  const abandonMs = (opts.timeoutMs ?? SIGN_IN_TIMEOUT_MS) + 30_000
+  const abandonTimer = setTimeout(() => {
+    try { server.close() } catch {}
+    rejectCode(new Error("Timed out waiting for Amazon Quick browser sign-in"))
+  }, abandonMs)
+  abandonTimer.unref?.()
   const addr = server.address()
   const redirectUri = `http://127.0.0.1:${addr.port}`
 
-  const regRes = await fetchImpl(`${oidcBase}/client/register`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      clientName: "Amazon Quick",
-      clientType: "public",
-      scopes: ["quicksight:read_write"],
-      grantTypes: ["authorization_code", "refresh_token"],
-      redirectUris: [redirectUri],
-      issuerUrl,
-    }),
-  })
+  let regRes
+  try {
+    regRes = await fetchImpl(`${oidcBase}/client/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clientName: "Amazon Quick",
+        clientType: "public",
+        scopes: ["quicksight:read_write"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        redirectUris: [redirectUri],
+        issuerUrl,
+      }),
+    })
+  } catch (e) {
+    clearTimeout(abandonTimer)
+    server.close()
+    throw e
+  }
   const regJson = await regRes.json().catch(() => ({}))
   if (!regRes.ok || !regJson?.clientId) {
+    clearTimeout(abandonTimer)
     server.close()
     throw new Error(`OIDC client registration failed (${regRes.status}): ${regJson?.error_description || regJson?.message || regRes.statusText}`)
   }
@@ -695,6 +735,7 @@ export async function browserSignIn(inputs = {}, opts = {}) {
         return { type: "failed", error: e?.message ?? String(e) }
       } finally {
         clearTimeout(timer)
+        clearTimeout(abandonTimer)
         server.close()
       }
     },
@@ -812,11 +853,152 @@ export async function invokeQbsApi(a, path, method = "GET", body = {}, opts = {}
   return payload
 }
 
+const settingsCache = new Map()
+const SETTINGS_CACHE_MS = 2 * 60 * 1000
+
 export async function fetchQuickSettings(a, opts = {}) {
+  const key = `${a?.tenantUrl || ""}|${a?.awsAccountId || ""}|${a?.accountId || ""}`
+  const canCache = !opts.fetch && !opts.noCache
+  const now = opts.now ?? Date.now()
+  if (canCache) {
+    const hit = settingsCache.get(key)
+    if (hit && now - hit.at < SETTINGS_CACHE_MS) return hit.value
+  }
   const res = await invokeQbsApi(a, "api/ws-rpc", "POST", { type: "get_settings", payload: {} }, opts)
   const frames = Array.isArray(res?.frames) ? res.frames : []
-  const settingsFrame = frames.find((f) => f?.type === "settings")
-  return settingsFrame?.payload ?? res?.payload ?? res ?? null
+  const settings = frames.find((f) => f?.type === "settings")?.payload ?? res?.payload ?? res ?? null
+  if (canCache && settings) {
+    settingsCache.set(key, { at: now, value: settings })
+    if (settingsCache.size > 32) {
+      const oldest = settingsCache.keys().next().value
+      if (oldest !== undefined) settingsCache.delete(oldest)
+    }
+  }
+  return settings
+}
+
+/**
+ * Upload an attachment (`Uint8Array` / `Buffer`) to Amazon Quick (`AIDP` or `Gateway`),
+ * poll its DLP scan verdict when required, and deliver it to `threadId` so it can be referenced in `user_message.attachments`.
+ */
+export async function uploadQuickAttachment(a, file, opts = {}) {
+  const fetchImpl = opts.fetch ?? fetch
+  const name = str(file?.name) || "attachment.bin"
+  const mimeType = str(file?.mimeType) || "application/octet-stream"
+  const raw = file?.bytes instanceof Uint8Array ? file.bytes : new Uint8Array(file?.bytes || 0)
+  if (!raw.byteLength) throw new Error("Cannot upload empty attachment")
+  const contentSha256 = createHash("sha256").update(raw).digest("hex")
+  const gateway = isGatewayProvider(a.providerType)
+  const surface = surfaceTypeForPlatform(opts.platform)
+
+  let attachmentId = ""
+  let dlpJobId = ""
+  let cellHost = ""
+
+  if (gateway) {
+    cellHost = await resolveGatewayHost(a, fetchImpl)
+    const acct = encodeURIComponent(a.awsAccountId || "")
+    if (!acct) throw new Error("Missing awsAccountId for Gateway attachment upload")
+    const qs = new URLSearchParams({
+      Operation: "ConversationServiceFileAttachmentProxy",
+      awsAccountId: a.awsAccountId,
+      name,
+      contentLength: String(raw.byteLength),
+      contentType: mimeType,
+      surfaceType: surface,
+    })
+    const upRes = await fetchImpl(`https://${cellHost}/uploads/accounts/${acct}/attachments/presigned-url?${qs.toString()}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${a.access}`, "Content-Type": mimeType },
+      body: raw,
+      signal: opts.signal ?? AbortSignal.timeout(60000),
+    })
+    const upBody = await upRes.json().catch(() => ({}))
+    if (!upRes.ok || !upBody?.attachmentId) {
+      const err = new Error(`Gateway attachment upload failed (${upRes.status})`)
+      err.status = upRes.status
+      err.invalidToken = upRes.status === 401
+      throw err
+    }
+    attachmentId = str(upBody.attachmentId)
+    dlpJobId = str(upBody.dlpJobId ?? upBody.DlpJobId)
+  } else {
+    const qs = new URLSearchParams({
+      name,
+      contentType: mimeType,
+      contentLength: String(raw.byteLength),
+    })
+    const upRes = await fetchImpl(`${a.tenantUrl}/integration/quick-work/upload-attachment?${qs.toString()}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${a.access}`, "Content-Type": "application/octet-stream" },
+      body: raw,
+      signal: opts.signal ?? AbortSignal.timeout(60000),
+    })
+    const upBody = await upRes.json().catch(() => ({}))
+    if (!upRes.ok || !upBody?.attachmentId) {
+      const err = new Error(`AIDP attachment upload failed (${upRes.status})`)
+      err.status = upRes.status
+      err.invalidToken = upRes.status === 401
+      throw err
+    }
+    attachmentId = str(upBody.attachmentId)
+  }
+
+  const maxPolls = Number(opts.maxDlpPolls) > 0 ? Number(opts.maxDlpPolls) : 15
+  const pollMs = Number(opts.dlpPollMs) >= 0 ? Number(opts.dlpPollMs) : 800
+  for (let i = 0; i < maxPolls; i++) {
+    let dlpRes
+    if (gateway) {
+      const acct = encodeURIComponent(a.awsAccountId)
+      dlpRes = await fetchImpl(`https://${cellHost}/dlp/internal/${acct}/data-loss-prevention/job/describe-user-aware`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${a.access}`, "Content-Type": "application/json" },
+        body: JSON.stringify(dlpJobId ? { DlpJobId: dlpJobId } : { ClientReferenceId: attachmentId }),
+        signal: opts.signal ?? AbortSignal.timeout(15000),
+      })
+    } else {
+      const qs = new URLSearchParams({ attachmentId })
+      dlpRes = await fetchImpl(`${a.tenantUrl}/integration/quick-work/attachment-dlp-status?${qs.toString()}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${a.access}` },
+        signal: opts.signal ?? AbortSignal.timeout(15000),
+      })
+    }
+    if (dlpRes.ok) {
+      const dlp = await dlpRes.json().catch(() => ({}))
+      const status = str(dlp.dlpJobStatus ?? dlp.DlpJobStatus).toUpperCase()
+      const action = str(dlp.policyAction ?? dlp.PolicyAction).toUpperCase()
+      if (status === "COMPLETED" || status === "SKIPPED" || status === "NOT_APPLICABLE") {
+        if (action && action !== "ALLOW" && action !== "WARN") {
+          throw new Error(`Attachment blocked by DLP policy (${action})`)
+        }
+        break
+      }
+      if (status === "FAILED" || status === "ERROR") {
+        throw new Error(`Attachment DLP scan failed (${status})`)
+      }
+    }
+    if (i + 1 < maxPolls && pollMs > 0) {
+      await new Promise((r) => setTimeout(r, pollMs))
+    }
+  }
+
+  let deliveredPath = ""
+  if (file?.threadId) {
+    const delivered = await invokeQbsApi(a, `files/upload/${encodeURIComponent(file.threadId)}`, "POST", { attachmentId }, opts)
+    deliveredPath = str(delivered?.path || delivered?.files?.[0]?.path)
+  }
+
+  return {
+    type: mimeType.startsWith("image/") ? "image" : "file",
+    name,
+    size: raw.byteLength,
+    mimeType,
+    path: deliveredPath || name,
+    attachmentId,
+    contentSha256,
+    boundOutOfBand: true,
+  }
 }
 
 function windowFromQuota(name, q) {

@@ -19,10 +19,13 @@
 - **联网搜索与客户端工具调用**：
   - 默认开启 `web_search_enabled: true`（与桌面端一致，也可通过请求体 `web_search_enabled: false` 关闭），并处理服务端工具流事件（`tool_start` / `tool_result` 等）。
   - 将客户端 `system` 指令与 OpenAI `tools` 定义通过 `<instructions>` 注入消息开头，并在消息末尾追加 `<client_tool_directive>` 强约束以屏蔽 Quick 云端沙箱写文件行为；将 `role: "tool"` 格式化为 `<tool_result>`，解析跨分片 `<tool_call>`（兼容可选 JSON 代码块围栏）以及 Anthropic 原生 `<function_calls><invoke><parameter>` XML 工具调用并按 Schema 还原参数类型，同时默认不发送伪造的 `outpostId`，确保 Zed / Magpie / OpenCode 的读写与终端工具可靠触发（使用写入/终端能力时，请确认客户端已启用 Write/Edit/Terminal 工具而非仅只读模式）。
-- **有状态线程增量续传（1M 上下文）与 64 KB 帧压缩兜底**：
-  - 按「账号 + 会话 ID / 首轮消息前缀哈希 + 工具与系统环境摘要」缓存并复用服务端 `thread_id`（`session_connect` 携带 `session_id` 与 `focus_only: true`），在连续多轮工具调用与对话中**仅增量发送新增的 `User` / `<tool_result>`**，充分利用 Quick 后端 1M tokens 上下文记忆并避免重复重传数十 KB 的系统提示词。
+- **有状态线程增量续传（1M 上下文）与 64 KB 帧压缩 / 云端附件兜底**：
+  - 按「账号 + 会话 ID / 首轮消息前缀哈希 + 工具集合摘要」缓存并复用服务端 `thread_id`（`session_connect` 携带 `session_id` 与 `focus_only: true`），在连续多轮工具调用与对话中**仅增量发送新增的 `User` / `<tool_result>`**；当 IDE 动态系统上下文（打开文件、光标、诊断信息等）变化时自动发送轻量 `<system_context_update>` 增量段，同时保持线程连续性与 1M 上下文记忆。
   - 若发生切号、编辑或回退历史，或缓存线程已在服务端失效，自动无缝回退到新建 `thread_id` 与全量重传。
-  - 对单次请求始终按 `AIDP` Base64 出站帧字节数（安全控制在 58 KB 以内，低于 AWS Quick 的 64 KB 单消息上限）自动分级压缩；若上游仍报大小超限则返回 HTTP `400` 避免无效重试。（如需纯无状态版可切换至 Git 分支 `v0.1.3`。）
+  - 对单次请求始终按 `AIDP` Base64 出站帧字节数（安全控制在 58 KB 以内，低于 AWS Quick 的 64 KB 单消息上限）自动分级压缩；遇到超大文本或多模态 `image_url`（`data:` / 本地文件路径 / HTTP URL），支持自动上传至 Quick 云端附件存储（兼容 `AIDP` 与 `Gateway` 路径 + DLP 安全扫描 + `files/upload` 注入）并携带 `attachments` 元数据发送。若上游仍报大小超限则返回 HTTP `400` 避免无效重试。（如需纯无状态版可切换至 Git 分支 `v0.1.3`。）
+- **长连接分片重组与稳定性强化**：
+  - 支持入站 `_chunked_frame` 分片重组，避免超长响应跨多帧被截断；内置 WebSocket 建连（15s）与流式空闲（90s）超时保护并返回明确 HTTP `504`。
+  - 桌面端凭证基于 `profiles.json` 文件 `mtime` 与 Token 过期时间智能缓存，避免每轮重复拉起系统凭据进程；Quick 账号配置（`settings`）按账号缓存 2 分钟；浏览器 OAuth 回调服务支持超时自动关闭，防止放弃登录时残留本地端口占用。
 - **动态模型列表与用量查询**：通过 `api/ws-rpc`（`get_settings`）获取账号已启用的模型槽位，并通过 `profile/usage` 查询月度与会话配额窗口及重置时间。
 
 ## 安装方式（Magpie）
@@ -99,10 +102,12 @@ Works with **OpenCode 1.x**, **OpenCode 2.x**, and **Magpie** with zero external
 - **Web Search & Client Tool Calling**:
   - Defaults `web_search_enabled` to `true` (matching the desktop app; override with `web_search_enabled: false`) and handles server-side tool stream events (`tool_start`, `tool_result`, etc.).
   - Places `system` instructions and OpenAI `tools` declarations inside `<instructions>`, appends a trailing `<client_tool_directive>` to prevent Quick's cloud sandbox from writing to `/workspace` instead of calling client tools, formats `tool` results as `<tool_result>`, and parses both chunked `<tool_call>` JSON blocks (including fenced JSON) and Anthropic `<function_calls><invoke><parameter>` XML calls with schema-aware type coercion while omitting fabricated `outpostId` values (make sure write/terminal tools are enabled in your client such as Zed/Magpie Write mode rather than read-only Ask mode).
-- **Stateful Thread Continuation (1M Context) & 64 KB Frame Fitting**:
-  - Tracks active `(account, session / message-prefix, system+tools digest)` threads and reuses Quick's server-side `thread_id` (`session_connect` with `session_id` + `focus_only: true`), sending **only the incremental `User` / `<tool_result>` delta** on matching follow-up turns so multi-turn agent loops can leverage Quick's 1M backend context without resending huge prompts.
+- **Stateful Thread Continuation (1M Context), 64 KB Frame Fitting & Cloud Attachments**:
+  - Tracks active `(account, session / message-prefix, tools digest)` threads and reuses Quick's server-side `thread_id` (`session_connect` with `session_id` + `focus_only: true`), sending **only the incremental `User` / `<tool_result>` delta** on matching follow-up turns; when dynamic IDE `system` context (open files, cursor, diagnostics) updates between turns, appends a compact `<system_context_update>` delta without breaking `thread_id` continuity.
   - Automatically isolates accounts and transparently falls back to a fresh `thread_id` whenever history is edited or a resumed server thread expires.
-  - Measures the encoded `AIDP` Base64 outbound frame size (kept within 58 KB, safely below Amazon Quick's 64 KB limit) and progressively compacts verbose schemas, older turns, and oversized system text while preserving the latest turn and `<client_tool_directive>`, mapping upstream size-limit errors to HTTP `400`. (Branch `v0.1.3` preserves the earlier purely stateless release.)
+  - Measures the encoded `AIDP` Base64 outbound frame size (kept within 58 KB, safely below Amazon Quick's 64 KB limit) and progressively compacts verbose schemas, older turns, and oversized system text while preserving the latest turn and `<client_tool_directive>`, mapping upstream size-limit errors to HTTP `400`. Also supports multimodal `image_url` inputs (`data:`, local files, HTTP URLs) and oversized user-message spillover via Quick cloud attachment uploads (`AIDP` + `Gateway` presigned upload, DLP status polling, and `files/upload/{threadId}` delivery). (Branch `v0.1.3` preserves the earlier purely stateless release.)
+- **Inbound Chunked Frames & Connection Hardening**:
+  - Reassembles inbound `_chunked_frame` payloads across out-of-order chunks, guards WebSocket connects (`15s`) and response idle stalls (`90s`) with HTTP `504` timeouts, caches desktop credentials against `profiles.json` `mtime` + token expiry, caches account settings for 2 minutes, and auto-closes abandoned OAuth loopback listeners.
 - **Dynamic Models & Usage**: Discovers active model slots from `api/ws-rpc` (`get_settings`) and reports monthly & session quota windows from `profile/usage`.
 
 ## Installation (Magpie)

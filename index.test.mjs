@@ -24,6 +24,7 @@ import {
   readDesktop,
   renewOidc,
   signInsIn,
+  uploadQuickAttachment,
   usageFromProfile,
 } from "./credentials.mjs"
 import {
@@ -818,4 +819,200 @@ test("stateful thread_id incremental continuation reuses threads, isolates accou
   assert.notEqual(retryMsg.thread_id, t1Msg.thread_id)
   assert.ok(retryMsg.text.includes("SYSTEM_PROMPT_V1"))
   assert.ok(sseBody.includes(retryMsg.thread_id))
+
+  // Turn 4 on acctA with updated IDE dynamic context inside system prompt: STILL reuses retryMsg.thread_id and sends <system_context_update> diff!
+  const sysDynamic = { role: "system", content: "SYSTEM_PROMPT_V1\nOpen file: app.py (line 42)" }
+  await executeSncsChat(
+    acctA,
+    {
+      model: "fast",
+      stream: false,
+      tools,
+      messages: [sysDynamic, u1, a1, tr1, a2, { role: "user", content: "Continue" }, { role: "assistant", content: `Answer for ${retryMsg.thread_id}` }, { role: "user", content: "Check line 42" }],
+    },
+    { WebSocket: MockWS, threadStore: store },
+  )
+  const dynMsg = sentFrames[5].find((f) => f.type === "user_message").payload
+  assert.equal(dynMsg.thread_id, retryMsg.thread_id)
+  assert.ok(!dynMsg.text.includes("SYSTEM_PROMPT_V1"))
+  assert.ok(dynMsg.text.includes("<system_context_update>\nOpen file: app.py (line 42)\n</system_context_update>"))
+})
+
+test("_chunked_frame reassembly, WebSocket connect/idle timeouts, uploadQuickAttachment, and image attachments work cleanly", async () => {
+  // 1. Out-of-order _chunked_frame reassembly + text_complete
+  const ChunkWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "message_start", payload: {} })
+      const inner = JSON.stringify({ type: "text_complete", payload: { text: "Chunked reply ok!" } })
+      const half = Math.ceil(inner.length / 2)
+      ws.emitAidpEvent({ type: "_chunked_frame", chunk_id: "c9", chunk_index: 1, total_chunks: 2, data: inner.slice(half) })
+      ws.emitAidpEvent({ type: "_chunked_frame", chunk_id: "c9", chunk_index: 0, total_chunks: 2, data: inner.slice(0, half) })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const acct = { providerType: "social", access: "tok", tenantUrl: "https://qbs-test.plato.ai.aws.dev" }
+  const chunkRes = await executeSncsChat(acct, { model: "fast", stream: false, messages: [{ role: "user", content: "Hi" }] }, { WebSocket: ChunkWS, stateful: false })
+  const chunkJson = await chunkRes.json()
+  assert.equal(chunkJson.choices[0].message.content, "Chunked reply ok!")
+
+  // 2. Connect timeout rejects cleanly with 504
+  const HangWS = makeMockWebSocketClass(() => {})
+  await assert.rejects(
+    executeSncsChat(acct, { model: "fast", messages: [{ role: "user", content: "Hi" }] }, { WebSocket: HangWS, connectTimeoutMs: 40, stateful: false }),
+    (e) => e.status === 504 && /timed out/i.test(e.message),
+  )
+
+  // 3. uploadQuickAttachment (AIDP) + multimodal image_url attachment in executeSncsChat
+  const calls = []
+  const mockFetch = async (url, init) => {
+    calls.push({ url, method: init?.method || "GET", body: init?.body })
+    if (url.includes("/integration/quick-work/upload-attachment")) {
+      return new Response(JSON.stringify({ attachmentId: "att-123" }), { status: 200 })
+    }
+    if (url.includes("/integration/quick-work/attachment-dlp-status")) {
+      return new Response(JSON.stringify({ dlpJobStatus: "COMPLETED", policyAction: "ALLOW" }), { status: 200 })
+    }
+    if (url.includes("/integration/quick-work/qbs-event")) {
+      return new Response(JSON.stringify({ eventResponse: { invokeAgentResponse: JSON.stringify({ statusCode: 200, body: JSON.stringify({ path: "/workspace/image_001.png" }) }) } }), { status: 200 })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  const uploaded = await uploadQuickAttachment(
+    acct,
+    { name: "shot.png", mimeType: "image/png", bytes: new Uint8Array([1, 2, 3, 4]), threadId: "thread-xyz" },
+    { fetch: mockFetch, dlpPollMs: 0 },
+  )
+  assert.equal(uploaded.attachmentId, "att-123")
+  assert.equal(uploaded.path, "/workspace/image_001.png")
+
+  const sentPayloads = []
+  const ImgWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sentPayloads.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "Saw image" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const b64Png = Buffer.from([137, 80, 78, 71]).toString("base64")
+  const imgRes = await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What is in this screenshot?" },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${b64Png}` } },
+          ],
+        },
+      ],
+    },
+    { WebSocket: ImgWS, fetch: mockFetch, dlpPollMs: 0, stateful: false },
+  )
+  assert.equal((await imgRes.json()).choices[0].message.content, "Saw image")
+  assert.equal(sentPayloads[0].attachments.length, 1)
+  assert.equal(sentPayloads[0].attachments[0].type, "image")
+  assert.equal(sentPayloads[0].attachments[0].attachmentId, "att-123")
+  assert.equal(sentPayloads[0].attachments[0].path, "/workspace/image_001.png")
+})
+
+test("readDesktop mtime cache avoids repeated OS keyring calls and Gateway uploadQuickAttachment works", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "aq-cache-"))
+  try {
+    writeFileSync(
+      join(dir, "profiles.json"),
+      JSON.stringify({
+        version: 1,
+        last_active: "social-cache",
+        entries: [
+          {
+            id: "social-cache",
+            provider: "social",
+            display_name: "Cache User",
+            login_metadata: {
+              tenant_url: "https://qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+              client_id: "cid-cache",
+            },
+          },
+        ],
+      }),
+    )
+
+    let osCalls = 0
+    const secretJson = JSON.stringify({
+      accessToken: "acc-cached",
+      refreshToken: "ref-cached",
+      expiresAt: "2026-11-22T12:00:00.000Z",
+    })
+    const mockExec = () => {
+      osCalls++
+      return secretJson
+    }
+    let mtimeMs = 1_000_000
+    const mockStat = () => ({ mtimeMs })
+    const baseNow = Date.parse("2026-11-22T11:30:00.000Z")
+
+    const d1 = readDesktop({ dir, platform: "win32", execFileSync: mockExec, statSync: mockStat, now: baseNow, noCache: false })
+    assert.equal(d1.access, "acc-cached")
+    assert.equal(osCalls, 1)
+
+    // 10s later (> 2s short TTL), same mtimeMs and unexpired token -> should reuse cache without spawning OS reader
+    const d2 = readDesktop({ dir, platform: "win32", execFileSync: mockExec, statSync: mockStat, now: baseNow + 10_000 })
+    assert.equal(d2.access, "acc-cached")
+    assert.equal(osCalls, 1)
+
+    // profiles.json mtime changed -> should re-read OS keyring
+    mtimeMs = 2_000_000
+    const d3 = readDesktop({ dir, platform: "win32", execFileSync: mockExec, statSync: mockStat, now: baseNow + 10_000 })
+    assert.equal(d3.access, "acc-cached")
+    assert.equal(osCalls, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // Gateway uploadQuickAttachment flow (PUT presigned-url + DLP describe-user-aware + files/upload)
+  const gwCalls = []
+  const gwFetch = async (url, init) => {
+    gwCalls.push({ url, method: init?.method || "GET" })
+    if (url.includes("/uploads/accounts/123456789012/attachments/presigned-url")) {
+      return new Response(JSON.stringify({ attachmentId: "gw-att-1", dlpJobId: "dlp-job-9" }), { status: 200 })
+    }
+    if (url.includes("/dlp/internal/123456789012/data-loss-prevention/job/describe-user-aware")) {
+      return new Response(JSON.stringify({ DlpJobStatus: "COMPLETED", PolicyAction: "ALLOW" }), { status: 200 })
+    }
+    if (url.includes("/invocations/rpc")) {
+      return new Response(JSON.stringify({ statusCode: 200, body: JSON.stringify({ path: "/workspace/gw-file.txt" }) }), { status: 200 })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  const gwAcct = {
+    providerType: "gateway",
+    access: "gw-tok",
+    tenantUrl: "https://qbs.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+    gatewayHost: "cell-1.us-east-1.quick.aws.dev",
+    awsAccountId: "123456789012",
+    region: "us-east-1",
+  }
+  const gwUp = await uploadQuickAttachment(
+    gwAcct,
+    { name: "context.txt", mimeType: "text/plain", bytes: Buffer.from("hello gateway"), threadId: "t-gw" },
+    { fetch: gwFetch, dlpPollMs: 0 },
+  )
+  assert.equal(gwUp.attachmentId, "gw-att-1")
+  assert.equal(gwUp.path, "/workspace/gw-file.txt")
+  assert.ok(gwCalls.some((c) => c.method === "PUT" && c.url.includes("/uploads/accounts/123456789012/attachments/presigned-url")))
+  assert.ok(gwCalls.some((c) => c.method === "POST" && c.url.includes("/dlp/internal/123456789012/data-loss-prevention/job/describe-user-aware")))
+  assert.ok(gwCalls.some((c) => c.method === "POST" && c.url.includes("/invocations/rpc")))
 })
