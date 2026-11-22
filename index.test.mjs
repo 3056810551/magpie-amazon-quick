@@ -319,9 +319,22 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.equal(sncs.userMessagePayload.agent_mode, "smart")
   assert.equal(sncs.userMessagePayload.thinking_effort, "medium")
   assert.equal(sncs.userMessagePayload.incognito, true)
-  assert.ok(sncs.userMessagePayload.custom_prompt.includes("Be concise."))
-  assert.ok(sncs.userMessagePayload.custom_prompt.includes("CLIENT TOOL CALLING PROTOCOL"))
-  assert.ok(sncs.userMessagePayload.text.includes("Tool Result (c1):\nhello"))
+  assert.equal(sncs.userMessagePayload.web_search_enabled, true)
+  assert.equal(sncs.sessionConnectPayload.outpostId, undefined)
+  assert.equal(sncs.userMessagePayload.outpostId, undefined)
+  assert.equal(sncs.userMessagePayload.custom_prompt, null)
+  assert.ok(sncs.userMessagePayload.text.includes("<instructions>"))
+  assert.ok(sncs.userMessagePayload.text.includes("Be concise."))
+  assert.ok(sncs.userMessagePayload.text.includes("CLIENT TOOL CALLING PROTOCOL"))
+  assert.ok(sncs.userMessagePayload.text.includes('<tool_result id="c1">\nhello\n</tool_result>'))
+
+  const sncsNoWeb = openaiToSncsRequest(
+    { model: "fast", web_search_enabled: false, messages: [{ role: "user", content: "Ping" }] },
+    { outpostId: "outpost-123" },
+  )
+  assert.equal(sncsNoWeb.userMessagePayload.web_search_enabled, false)
+  assert.equal(sncsNoWeb.sessionConnectPayload.outpostId, "outpost-123")
+  assert.equal(sncsNoWeb.userMessagePayload.outpostId, "outpost-123")
 
   // Stream splitter across partial tag prefixes
   const splitter = createToolCallSplitter(true)
@@ -340,6 +353,14 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.equal(calls.length, 1)
   assert.equal(calls[0].function.name, "read_file")
   assert.equal(calls[0].function.arguments, '{"p":1}')
+
+  const fencedSplitter = createToolCallSplitter(true)
+  const fencedOut = fencedSplitter.push('<tool_call>\n```json\n{"name":"write_file","arguments":{"path":"a.txt"}}\n```\n</tool_call>')
+  const fencedEnd = fencedSplitter.flush()
+  const fencedCalls = [...fencedOut.toolCalls, ...fencedEnd.toolCalls]
+  assert.equal(fencedCalls.length, 1)
+  assert.equal(fencedCalls[0].function.name, "write_file")
+  assert.equal(fencedCalls[0].function.arguments, '{"path":"a.txt"}')
 })
 
 function makeMockWebSocketClass(responder) {
@@ -394,6 +415,8 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
     queueMicrotask(() => {
       emit({ type: "session_established", payload: {} })
       emit({ type: "message_start", payload: {} })
+      emit({ type: "tool_start", payload: { tool_name: "web_search", tool_id: "ws-1" } })
+      emit({ type: "tool_result", payload: { tool_id: "ws-1", result: "ok" } })
       emit({ type: "thinking_delta", payload: { delta: "Let me think" } })
       emit({ type: "text_delta", payload: { delta: "Hello world!" } })
       emit({ type: "turn_usage", payload: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } })
