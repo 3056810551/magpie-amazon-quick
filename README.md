@@ -18,7 +18,8 @@
 - **SNCS WebSocket 对话桥接**：将 OpenAI 兼容的 `/chat/completions` 请求（支持流式 SSE 与非流式 JSON、`reasoning_effort` / `thinking_delta` → `reasoning_content` 输出）适配到 Amazon Quick 的 SpaceNeedleConversationService（`SNCS`）双向 WebSocket（同时兼容 `AIDP` 与 `Gateway` 传输模式），并提供 `https://quick.aws.com/v1` / 账号 `tenantUrl` 基准地址支持。
 - **联网搜索与客户端工具调用**：
   - 默认开启 `web_search_enabled: true`（与桌面端一致，也可通过请求体 `web_search_enabled: false` 关闭），并处理服务端工具流事件（`tool_start` / `tool_result` 等）。
-  - 将客户端 `system` 指令与 OpenAI `tools` 定义通过 `<instructions>` 注入对话消息、`role: "tool"` 格式化为 `<tool_result>`，并解析跨分片 `<tool_call>`（兼容可选 JSON 代码块围栏），使 Magpie / OpenCode Agent 模式下的本地读写与命令工具可直接运行（且默认不发送伪造的 `outpostId`）。
+  - 将客户端 `system` 指令与 OpenAI `tools` 定义通过 `<instructions>` 注入消息开头，并在消息末尾追加 `<client_tool_directive>` 强约束以屏蔽 Quick 云端沙箱写文件行为；将 `role: "tool"` 格式化为 `<tool_result>`，解析跨分片 `<tool_call>`（兼容可选 JSON 代码块围栏），同时默认不发送伪造的 `outpostId`，确保 Zed / Magpie / OpenCode 的读写与终端工具可靠触发（使用写入/终端能力时，请确认客户端已启用 Write/Edit/Terminal 工具而非仅只读模式）。
+- **64 KB SNCS 单帧自适应压缩**：按 `AIDP` Base64 出站帧字节数（安全控制在 58 KB 以内，低于 AWS Quick 的 64 KB 单消息上限）自动分级压缩——超限时先将冗长工具 JSON Schema 精简为带类型与必填标记的紧凑签名，再逐级裁剪较早中间轮次或超长系统文本，同时保留最新用户输入与 `<client_tool_directive>`；若上游仍报大小超限则返回 HTTP `400` 避免无效重试。
 - **动态模型列表与用量查询**：通过 `api/ws-rpc`（`get_settings`）获取账号已启用的模型槽位，并通过 `profile/usage` 查询月度与会话配额窗口及重置时间。
 
 ## 安装方式（Magpie）
@@ -94,7 +95,8 @@ Works with **OpenCode 1.x**, **OpenCode 2.x**, and **Magpie** with zero external
 - **SNCS WebSocket Bridge**: Adapts OpenAI-compatible `/chat/completions` (both streaming SSE and non-streaming JSON, including `reasoning_effort` / `thinking_delta` → `reasoning_content`) onto Amazon Quick's SpaceNeedleConversationService (`SNCS`) bidirectional WebSocket (`AIDP` and `Gateway` transports), backed by the account's `tenantUrl` or `https://quick.aws.com/v1` base URL.
 - **Web Search & Client Tool Calling**:
   - Defaults `web_search_enabled` to `true` (matching the desktop app; override with `web_search_enabled: false`) and handles server-side tool stream events (`tool_start`, `tool_result`, etc.).
-  - Places `system` instructions and OpenAI `tools` declarations in `<instructions>` on user turns, formats `tool` results as `<tool_result>`, and parses chunked `<tool_call>` blocks (including fenced JSON) while omitting fabricated `outpostId` values so Magpie / OpenCode local tools execute reliably.
+  - Places `system` instructions and OpenAI `tools` declarations inside `<instructions>`, appends a trailing `<client_tool_directive>` to prevent Quick's cloud sandbox from writing to `/workspace` instead of calling client tools, formats `tool` results as `<tool_result>`, and parses chunked `<tool_call>` blocks (including fenced JSON) while omitting fabricated `outpostId` values (make sure write/terminal tools are enabled in your client such as Zed/Magpie Write mode rather than read-only Ask mode).
+- **64 KB SNCS Frame Budget Fitting**: Measures the encoded `AIDP` Base64 outbound frame size (kept within 58 KB, safely below Amazon Quick's 64 KB limit) and progressively compacts verbose tool JSON Schemas into concise typed signatures, older turns, and oversized system text while preserving the latest turn and `<client_tool_directive>`; maps upstream size-limit errors to HTTP `400` to avoid futile retries.
 - **Dynamic Models & Usage**: Discovers active model slots from `api/ws-rpc` (`get_settings`) and reports monthly & session quota windows from `profile/usage`.
 
 ## Installation (Magpie)
