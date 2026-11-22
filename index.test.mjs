@@ -801,6 +801,7 @@ test("stateful thread_id incremental continuation reuses threads, isolates accou
   assert.ok(!t2Msg.text.includes("SYSTEM_PROMPT_V1"))
   assert.ok(t2Msg.text.includes("SECRET_LINE"))
   assert.ok(t2Msg.text.includes("<client_tool_directive>"))
+  assert.ok(t2Msg.text.includes("live execution outputs"))
   assert.ok(r2.choices[0].message.content.includes(t1Msg.thread_id))
 
   // Turn 3 with different account: must NOT reuse acctA's threadId

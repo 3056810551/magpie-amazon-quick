@@ -358,8 +358,8 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
   }
   return [
     "CLIENT TOOL CALLING PROTOCOL:",
-    "- This conversation is connected to an active external IDE/client session that executes the declared client tools below on the user's local workspace.",
-    "- Prefer the declared client tools below for inspecting, reading, editing, or running commands in the user's local project.",
+    "- This conversation is connected to an active external IDE/client session that executes the declared client tools below directly on the user's local workspace.",
+    "- Quick's internal cloud sandbox (`workspace/artifacts`, `qw-file://`) and outpost daemon status are separate from this IDE connection; use the declared client tools below for all local file inspection, writes, edits, and commands rather than writing files to `workspace/artifacts` or `qw-file://`.",
     "- To call client tools, emit <tool_call>...</tool_call> blocks on separate lines with valid JSON containing \"name\" and \"arguments\":",
     "<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>",
     "- Pause after emitting <tool_call> block(s) to receive the <tool_result> turn." + choiceNote,
@@ -368,7 +368,7 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
   ].join("\n")
 }
 
-function formatTrailingToolDirective(tools, toolChoice) {
+function formatTrailingToolDirective(tools, toolChoice, hasToolResults = false) {
   const names = tools.map((t) => (t?.function ?? t)?.name).filter(Boolean)
   if (!names.length) return ""
   let choiceRule = ""
@@ -376,10 +376,14 @@ function formatTrailingToolDirective(tools, toolChoice) {
   else if (toolChoice && typeof toolChoice === "object" && toolChoice.function?.name) {
     choiceRule = ` You MUST invoke "${toolChoice.function.name}" via <tool_call> now.`
   }
+  const resultHint = hasToolResults
+    ? "The <tool_result> block(s) above are the live execution outputs from your client <tool_call>(s) on the user's local machine in this active IDE session. Continue cleanly from those results."
+    : ""
   return [
     "<client_tool_directive>",
     `Available client tool names: ${names.join(", ")}.`,
-    "Use the listed client tools via <tool_call>{\"name\":\"<tool_name>\",\"arguments\":{...}}</tool_call> when working with the local workspace, then pause for <tool_result>. If a requested write or command tool is absent from this list, inspect with available read tools or explain which capability is unavailable in the client." + choiceRule,
+    ...(resultHint ? [resultHint] : []),
+    "Use the listed client tools via <tool_call>{\"name\":\"<tool_name>\",\"arguments\":{...}}</tool_call> for all local workspace actions rather than Quick internal `workspace/artifacts` (`qw-file://`), and pause for <tool_result>. The IDE executes these client tools directly regardless of outpost daemon status." + choiceRule,
     "</client_tool_directive>",
   ].join("\n")
 }
@@ -432,7 +436,7 @@ function toolsDigest(tools, toolChoice) {
   return sha256Hex(JSON.stringify([toolSig, toolChoice ?? null]))
 }
 
-function systemDeltaText(prevSys, nextSys, maxDiffChars = 6000) {
+function systemDeltaText(prevSys, nextSys, maxDiffChars = 20000) {
   if (prevSys === nextSys) return ""
   if (!prevSys) return nextSys.length <= maxDiffChars ? nextSys : null
   const a = prevSys.split(/\r?\n/)
@@ -615,11 +619,13 @@ export function openaiToSncsRequest(body, opts = {}) {
 
   const resumeState = opts.resumeState || null
   const isResume = Boolean(resumeState?.threadId && Array.isArray(resumeState?.deltaMessages) && resumeState.deltaMessages.length)
+  const outboundMsgs = isResume ? resumeState.deltaMessages : convoMessages
+  const hasToolResults = outboundMsgs.some((m) => String(m?.role || "").toLowerCase() === "tool")
   const fullToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, false) : ""
   const compactToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, true) : ""
-  const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice) : ""
+  const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice, hasToolResults) : ""
 
-  let convoBlocks = formatConvoBlocks(isResume ? resumeState.deltaMessages : convoMessages)
+  let convoBlocks = formatConvoBlocks(outboundMsgs)
 
   const outpostId = opts.outpostId || randomUUID()
   const workingSessionId = (isResume && resumeState.workingSessionId) || opts.workingSessionId || randomUUID()
@@ -720,8 +726,6 @@ export function openaiToSncsRequest(body, opts = {}) {
       over = measure(text) - maxFrameBytes
     }
   }
-
-  const outboundMsgs = isResume ? resumeState.deltaMessages : convoMessages
 
   return {
     modelId,
