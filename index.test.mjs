@@ -28,6 +28,7 @@ import {
 } from "./credentials.mjs"
 import {
   configModels,
+  createThreadStore,
   createToolCallSplitter,
   executeSncsChat,
   MAX_USER_MESSAGE_FRAME_BYTES,
@@ -698,4 +699,123 @@ test("browserSignIn registers quicksight:read_write OIDC client and handles loop
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("createToolCallSplitter parses Anthropic <function_calls><invoke> XML blocks and coerces schema types", () => {
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        parameters: { type: "object", properties: { path: { type: "string" }, limit: { type: "integer" }, raw: { type: "boolean" } } },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "write_file",
+        parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } } },
+      },
+    },
+  ]
+  const sample =
+    'Intro\n<function_calls><invoke name="read_file"><parameter name="path">123</parameter><parameter name="limit">50</parameter><parameter name="raw">true</parameter></invoke><invoke name="write_file"><parameter name="path">a.py</parameter><parameter name="content">\nprint("hi")\n</parameter></invoke></function_calls>\nDone.'
+  const splitter = createToolCallSplitter(true, tools)
+  let text = ""
+  const outCalls = []
+  for (let i = 0; i < sample.length; i += 2) {
+    const r = splitter.push(sample.slice(i, i + 2))
+    text += r.text
+    outCalls.push(...r.toolCalls)
+  }
+  const end = splitter.flush()
+  text += end.text
+  outCalls.push(...end.toolCalls)
+  assert.equal(text, "Intro\n\nDone.")
+  assert.equal(outCalls.length, 2)
+  assert.equal(outCalls[0].function.name, "read_file")
+  assert.deepEqual(JSON.parse(outCalls[0].function.arguments), { path: "123", limit: 50, raw: true })
+  assert.equal(outCalls[1].function.name, "write_file")
+  assert.deepEqual(JSON.parse(outCalls[1].function.arguments), { path: "a.py", content: 'print("hi")' })
+})
+
+test("stateful thread_id incremental continuation reuses threads, isolates accounts, and recovers from stale errors", async () => {
+  const store = createThreadStore()
+  const sentFrames = []
+  let failResumed = false
+
+  const decodeOutboundAidp = (rawBytes) => {
+    const outer = JSON.parse(Buffer.from(rawBytes).toString("utf8"))
+    return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+  }
+
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      const frames = ws.sent.map(decodeOutboundAidp)
+      sentFrames.push(frames)
+      const connect = frames.find((f) => f.type === "session_connect")?.payload
+      const userMsg = frames.find((f) => f.type === "user_message")?.payload
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (failResumed && connect?.focus_only) {
+        failResumed = false
+        ws.emitAidpEvent({ type: "error", payload: { message: "session not found" } })
+        return
+      }
+      ws.emitAidpEvent({ type: "message_start", payload: {} })
+      const reply =
+        sentFrames.length === 1
+          ? '<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>'
+          : `Answer for ${userMsg.thread_id}`
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: reply } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  const acctA = { providerType: "social", access: "tok-a", tenantUrl: "https://qbs-a.plato.ai.aws.dev", accountId: "acct-a" }
+  const acctB = { providerType: "social", access: "tok-b", tenantUrl: "https://qbs-b.plato.ai.aws.dev", accountId: "acct-b" }
+  const tools = [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
+  const sys = { role: "system", content: "SYSTEM_PROMPT_V1" }
+  const u1 = { role: "user", content: "Inspect a.txt" }
+
+  // Turn 1: fresh thread
+  const r1 = await (await executeSncsChat(acctA, { model: "fast", stream: false, tools, messages: [sys, u1] }, { WebSocket: MockWS, threadStore: store })).json()
+  assert.equal(r1.choices[0].finish_reason, "tool_calls")
+  const t1Connect = sentFrames[0].find((f) => f.type === "session_connect").payload
+  const t1Msg = sentFrames[0].find((f) => f.type === "user_message").payload
+  assert.equal(t1Connect.session_id, undefined)
+  assert.ok(t1Msg.text.includes("SYSTEM_PROMPT_V1"))
+
+  // Turn 2 (no sessionId header): matches head index, reuses thread_id and omits <instructions>
+  const a1 = r1.choices[0].message
+  const tr1 = { role: "tool", tool_call_id: a1.tool_calls[0].id, content: "SECRET_LINE" }
+  const r2 = await (await executeSncsChat(acctA, { model: "fast", stream: false, tools, messages: [sys, u1, a1, tr1] }, { WebSocket: MockWS, threadStore: store })).json()
+  const t2Connect = sentFrames[1].find((f) => f.type === "session_connect").payload
+  const t2Msg = sentFrames[1].find((f) => f.type === "user_message").payload
+  assert.equal(t2Connect.session_id, t1Msg.thread_id)
+  assert.equal(t2Connect.focus_only, true)
+  assert.equal(t2Msg.thread_id, t1Msg.thread_id)
+  assert.ok(!t2Msg.text.includes("SYSTEM_PROMPT_V1"))
+  assert.ok(t2Msg.text.includes("SECRET_LINE"))
+  assert.ok(t2Msg.text.includes("<client_tool_directive>"))
+  assert.ok(r2.choices[0].message.content.includes(t1Msg.thread_id))
+
+  // Turn 3 with different account: must NOT reuse acctA's threadId
+  const a2 = r2.choices[0].message
+  const u2 = { role: "user", content: "Follow up on other account" }
+  await executeSncsChat(acctB, { model: "fast", stream: false, tools, messages: [sys, u1, a1, tr1, a2, u2] }, { WebSocket: MockWS, threadStore: store })
+  const t3Msg = sentFrames[2].find((f) => f.type === "user_message").payload
+  assert.notEqual(t3Msg.thread_id, t1Msg.thread_id)
+  assert.ok(t3Msg.text.includes("SYSTEM_PROMPT_V1"))
+
+  // Turn 3 on acctA with stale server thread (stream: true): fails on resume and auto-retries fresh thread
+  failResumed = true
+  const sRes = await executeSncsChat(acctA, { model: "fast", stream: true, tools, messages: [sys, u1, a1, tr1, a2, { role: "user", content: "Continue" }] }, { WebSocket: MockWS, threadStore: store })
+  const sseBody = await sRes.text()
+  assert.equal(sentFrames.length, 5) // turn 4 resumed + rejected -> turn 5 auto-retried fresh!
+  const retryMsg = sentFrames[4].find((f) => f.type === "user_message").payload
+  assert.notEqual(retryMsg.thread_id, t1Msg.thread_id)
+  assert.ok(retryMsg.text.includes("SYSTEM_PROMPT_V1"))
+  assert.ok(sseBody.includes(retryMsg.thread_id))
 })

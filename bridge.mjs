@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import {
   buildAidpInputFrame,
   buildGatewayInputFrame,
@@ -332,6 +332,186 @@ function formatTrailingToolDirective(tools, toolChoice) {
   ].join("\n")
 }
 
+const THREAD_CACHE_MAX = 200
+const THREAD_CACHE_TTL_MS = 2 * 3600_000
+
+function sha256Hex(str) {
+  return createHash("sha256").update(String(str ?? ""), "utf8").digest("hex")
+}
+
+function canonicalJson(val) {
+  if (val === null || typeof val !== "object") return JSON.stringify(val)
+  if (Array.isArray(val)) return `[${val.map(canonicalJson).join(",")}]`
+  const keys = Object.keys(val).sort()
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(val[k])}`).join(",")}}`
+}
+
+function normalizeToolCallsForDigest(calls) {
+  if (!Array.isArray(calls) || !calls.length) return []
+  return calls.map((tc) => {
+    const name = String(tc?.function?.name ?? tc?.name ?? "")
+    let args = tc?.function?.arguments ?? tc?.arguments ?? {}
+    if (typeof args === "string") {
+      try { args = JSON.parse(args) } catch {}
+    }
+    return { name, args: typeof args === "string" ? args : canonicalJson(args ?? {}) }
+  })
+}
+
+export function accountKeyOf(a) {
+  return `${a?.tenantUrl || ""}|${a?.awsAccountId || ""}|${a?.accountId || ""}`
+}
+
+function messageDigest(msg) {
+  const role = String(msg?.role || "user").toLowerCase()
+  const text = textFromContent(msg?.content).trim()
+  const calls = role === "assistant" ? normalizeToolCallsForDigest(msg?.tool_calls) : []
+  const callId = role === "tool" ? String(msg?.tool_call_id || msg?.name || "") : ""
+  return sha256Hex(JSON.stringify([role, text, calls, callId]))
+}
+
+function envDigest(systemParts, tools, toolChoice) {
+  const toolSig = (Array.isArray(tools) ? tools : [])
+    .map((t) => {
+      const fn = t?.function ?? t
+      return fn?.name ? [fn.name, fn.description || "", canonicalJson(fn.parameters ?? {})] : null
+    })
+    .filter(Boolean)
+  return sha256Hex(JSON.stringify([systemParts, toolSig, toolChoice ?? null]))
+}
+
+function formatConvoBlocks(msgs) {
+  if (msgs.length === 1 && String(msgs[0].role).toLowerCase() === "user" && !msgs[0].tool_calls?.length) {
+    return [textFromContent(msgs[0].content)]
+  }
+  const blocks = []
+  for (const msg of msgs) {
+    const role = String(msg.role || "user").toLowerCase()
+    if (role === "assistant") {
+      let content = textFromContent(msg.content)
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+        const calls = msg.tool_calls
+          .map((tc) => {
+            const name = tc?.function?.name || tc?.name || "unknown"
+            let args = tc?.function?.arguments ?? tc?.arguments ?? {}
+            if (typeof args === "string") {
+              try { args = JSON.parse(args) } catch {}
+            }
+            return `<tool_call>${JSON.stringify({ name, arguments: args })}</tool_call>`
+          })
+          .join("\n")
+        content = content ? `${content}\n${calls}` : calls
+      }
+      blocks.push(`Assistant:\n${content}`)
+    } else if (role === "tool") {
+      const callId = msg.tool_call_id || msg.name || "tool"
+      const nameAttr = msg.name ? ` name="${msg.name}"` : ""
+      blocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
+    } else {
+      blocks.push(`User:\n${textFromContent(msg.content)}`)
+    }
+  }
+  return blocks.length ? blocks : ["Hello"]
+}
+
+/**
+ * In-memory bounded thread cache mapping conversation prefixes & session IDs to Amazon Quick `threadId`s.
+ */
+export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS) {
+  const byKey = new Map()
+
+  const prune = (now) => {
+    for (const [k, v] of byKey) {
+      if (now - v.updatedAt > ttlMs) byKey.delete(k)
+    }
+    while (byKey.size > maxEntries) {
+      const oldest = byKey.keys().next()
+      if (oldest.done) break
+      byKey.delete(oldest.value)
+    }
+  }
+
+  const touch = (k) => {
+    const v = byKey.get(k)
+    if (!v) return null
+    if (Date.now() - v.updatedAt > ttlMs) {
+      byKey.delete(k)
+      return null
+    }
+    byKey.delete(k)
+    byKey.set(k, v)
+    return v
+  }
+
+  return {
+    lookup(accountKey, sessionId, envSig, convoMessages) {
+      if (!Array.isArray(convoMessages) || convoMessages.length < 2) return null
+      const hashes = convoMessages.map(messageDigest)
+      const candidates = []
+      if (sessionId) candidates.push(`sess:${accountKey}|${sessionId}`)
+      candidates.push(`head:${accountKey}|${envSig}|${hashes[0]}`)
+
+      for (const k of candidates) {
+        const entry = touch(k)
+        if (!entry) continue
+        if (entry.accountKey !== accountKey || entry.envSig !== envSig) continue
+        const prefixLen = entry.msgHashes.length
+        if (convoMessages.length < prefixLen + 2) continue
+        let prefixOk = true
+        for (let i = 0; i < prefixLen; i++) {
+          if (hashes[i] !== entry.msgHashes[i]) {
+            prefixOk = false
+            break
+          }
+        }
+        if (!prefixOk) continue
+        const replyMsg = convoMessages[prefixLen]
+        if (String(replyMsg?.role || "").toLowerCase() !== "assistant") continue
+        if (entry.expectedAssistantSig && hashes[prefixLen] !== entry.expectedAssistantSig) continue
+        return {
+          key: k,
+          threadId: entry.threadId,
+          workingSessionId: entry.workingSessionId,
+          deltaMessages: convoMessages.slice(prefixLen + 1),
+          allHashes: hashes,
+          envSig,
+        }
+      }
+      return null
+    },
+    commit(accountKey, sessionId, state) {
+      const now = Date.now()
+      const record = { ...state, accountKey, updatedAt: now }
+      if (sessionId) {
+        const sk = `sess:${accountKey}|${sessionId}`
+        byKey.delete(sk)
+        byKey.set(sk, record)
+      }
+      if (record.msgHashes?.length) {
+        const hk = `head:${accountKey}|${record.envSig}|${record.msgHashes[0]}`
+        byKey.delete(hk)
+        byKey.set(hk, record)
+      }
+      prune(now)
+    },
+    invalidate(accountKey, sessionId, threadId) {
+      for (const [k, v] of byKey) {
+        if (
+          (threadId && v.threadId === threadId && v.accountKey === accountKey) ||
+          (sessionId && k === `sess:${accountKey}|${sessionId}`)
+        ) {
+          byKey.delete(k)
+        }
+      }
+    },
+    clear() {
+      byKey.clear()
+    },
+  }
+}
+
+export const DEFAULT_THREAD_STORE = createThreadStore()
+
 /**
  * Convert an OpenAI `/chat/completions` JSON request body into SNCS `user_message` fields,
  * compacting schemas and older turns when necessary so the outbound SNCS frame stays under the 64 KB limit.
@@ -356,46 +536,20 @@ export function openaiToSncsRequest(body, opts = {}) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
   const toolChoice = body?.tool_choice
   const hasTools = tools.length > 0 && toolChoice !== "none"
-  const fullToolsPrompt = hasTools ? formatToolsInstruction(tools, toolChoice, false) : ""
-  const compactToolsPrompt = hasTools ? formatToolsInstruction(tools, toolChoice, true) : ""
+  const envSig = envDigest(rawSystemParts, hasTools ? tools : [], toolChoice)
+  const convoHashes = convoMessages.map(messageDigest)
+
+  const resumeState = opts.resumeState || null
+  const isResume = Boolean(resumeState?.threadId && Array.isArray(resumeState?.deltaMessages) && resumeState.deltaMessages.length)
+  const fullToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, false) : ""
+  const compactToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, true) : ""
   const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice) : ""
 
-  let convoBlocks = []
-  if (convoMessages.length === 1 && String(convoMessages[0].role).toLowerCase() === "user" && !convoMessages[0].tool_calls?.length) {
-    convoBlocks = [textFromContent(convoMessages[0].content)]
-  } else {
-    for (const msg of convoMessages) {
-      const role = String(msg.role || "user").toLowerCase()
-      if (role === "assistant") {
-        let content = textFromContent(msg.content)
-        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-          const calls = msg.tool_calls
-            .map((tc) => {
-              const name = tc?.function?.name || tc?.name || "unknown"
-              let args = tc?.function?.arguments ?? tc?.arguments ?? {}
-              if (typeof args === "string") {
-                try { args = JSON.parse(args) } catch {}
-              }
-              return `<tool_call>${JSON.stringify({ name, arguments: args })}</tool_call>`
-            })
-            .join("\n")
-          content = content ? `${content}\n${calls}` : calls
-        }
-        convoBlocks.push(`Assistant:\n${content}`)
-      } else if (role === "tool") {
-        const callId = msg.tool_call_id || msg.name || "tool"
-        const nameAttr = msg.name ? ` name="${msg.name}"` : ""
-        convoBlocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
-      } else {
-        convoBlocks.push(`User:\n${textFromContent(msg.content)}`)
-      }
-    }
-    if (!convoBlocks.length) convoBlocks = ["Hello"]
-  }
+  let convoBlocks = formatConvoBlocks(isResume ? resumeState.deltaMessages : convoMessages)
 
   const outpostId = opts.outpostId || randomUUID()
-  const workingSessionId = opts.workingSessionId || randomUUID()
-  const threadId = `thread-${randomUUID()}`
+  const workingSessionId = (isResume && resumeState.workingSessionId) || opts.workingSessionId || randomUUID()
+  const threadId = (isResume && resumeState.threadId) || opts.threadId || `thread-${randomUUID()}`
   const messageId = `msg-${randomUUID()}`
   const webSearchEnabled =
     typeof body?.web_search_enabled === "boolean"
@@ -407,7 +561,7 @@ export function openaiToSncsRequest(body, opts = {}) {
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
   const composeText = (sysText, toolsText, blocks) => {
-    const instrParts = [sysText, toolsText].filter(Boolean)
+    const instrParts = isResume ? [] : [sysText, toolsText].filter(Boolean)
     const bodyText = blocks.filter(Boolean).join("\n\n")
     const parts = []
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
@@ -437,13 +591,13 @@ export function openaiToSncsRequest(body, opts = {}) {
 
   const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
 
-  let sysText = rawSystemParts.join("\n\n")
+  let sysText = isResume ? "" : rawSystemParts.join("\n\n")
   let blocks = [...convoBlocks]
   let toolsText = fullToolsPrompt
   let text = composeText(sysText, toolsText, blocks)
 
   // Stage 1: Compact verbose JSON tool schemas to concise typed signatures if over limit
-  if (measure(text) > maxFrameBytes && hasTools) {
+  if (!isResume && measure(text) > maxFrameBytes && hasTools) {
     toolsText = compactToolsPrompt
     text = composeText(sysText, toolsText, blocks)
   }
@@ -463,7 +617,7 @@ export function openaiToSncsRequest(body, opts = {}) {
   }
 
   // Stage 3: Trim long system prompt text, leaving tools protocol and latest user turn intact
-  if (measure(text) > maxFrameBytes && sysText) {
+  if (!isResume && measure(text) > maxFrameBytes && sysText) {
     const withoutSysBytes = measure(composeText("", toolsText, blocks))
     const charBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
     sysText = charBudget > 256 ? truncateMiddle(sysText, charBudget) : ""
@@ -491,6 +645,9 @@ export function openaiToSncsRequest(body, opts = {}) {
   return {
     modelId,
     hasTools,
+    isResume,
+    envSig,
+    convoHashes,
     stream: body?.stream === true,
     outpostId,
     workingSessionId,
@@ -499,6 +656,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     sessionConnectPayload: {
       surfaceType,
       ...(opts.outpostId ? { outpostId: opts.outpostId } : {}),
+      ...(isResume ? { session_id: threadId, focus_only: true, incognito: true } : {}),
       appVersion: APP_VERSION,
       acp_first_text: 1,
       user_notification: 1,
@@ -510,8 +668,10 @@ export function openaiToSncsRequest(body, opts = {}) {
   }
 }
 
-const OPEN_TAG = "<tool_call>"
-const CLOSE_TAG = "</tool_call>"
+const TAG_PAIRS = [
+  ["<tool_call>", "</tool_call>"],
+  ["<function_calls>", "</function_calls>"],
+]
 
 function longestSuffixPrefix(haystack, needle) {
   const max = Math.min(haystack.length, needle.length - 1)
@@ -519,6 +679,87 @@ function longestSuffixPrefix(haystack, needle) {
     if (haystack.endsWith(needle.slice(0, len))) return len
   }
   return 0
+}
+
+function maxOpenTagHold(haystack) {
+  let hold = 0
+  for (const [open] of TAG_PAIRS) {
+    const h = longestSuffixPrefix(haystack, open)
+    if (h > hold) hold = h
+  }
+  return hold
+}
+
+function buildParamTypeMap(tools) {
+  const map = new Map()
+  if (!Array.isArray(tools)) return map
+  for (const t of tools) {
+    const fn = t?.function ?? t
+    if (!fn?.name) continue
+    const propTypes = new Map()
+    const props = fn.parameters?.properties
+    if (props && typeof props === "object") {
+      for (const [k, v] of Object.entries(props)) {
+        if (v && typeof v === "object" && v.type) propTypes.set(k, v.type)
+      }
+    }
+    map.set(fn.name, propTypes)
+  }
+  return map
+}
+
+function coerceXmlParamValue(raw, expectedType) {
+  let v = raw
+  if (v.startsWith("\r\n")) v = v.slice(2)
+  else if (v.startsWith("\n")) v = v.slice(1)
+  if (v.endsWith("\r\n")) v = v.slice(0, -2)
+  else if (v.endsWith("\n")) v = v.slice(0, -1)
+
+  const wantsString = expectedType === "string" || (Array.isArray(expectedType) && expectedType.includes("string") && expectedType.length === 1)
+  if (wantsString) return v
+
+  const t = v.trim()
+  const wantsJson =
+    expectedType === "object" ||
+    expectedType === "array" ||
+    expectedType === "number" ||
+    expectedType === "integer" ||
+    expectedType === "boolean" ||
+    Array.isArray(expectedType)
+  if (wantsJson) {
+    try {
+      return JSON.parse(t)
+    } catch {}
+    return v
+  }
+  if ((t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))) {
+    try {
+      return JSON.parse(t)
+    } catch {}
+  }
+  return v
+}
+
+function parseInvokeBlocks(inner, paramTypeMap) {
+  const out = []
+  const invokeRe = /<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>([\s\S]*?)<\/invoke>/gi
+  let m
+  while ((m = invokeRe.exec(inner))) {
+    const name = (m[1] ?? m[2] ?? "").trim()
+    if (!name) continue
+    const body = m[3] || ""
+    const typeMap = paramTypeMap.get(name)
+    const args = {}
+    const paramRe = /<parameter\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>([\s\S]*?)<\/parameter>/gi
+    let pm
+    while ((pm = paramRe.exec(body))) {
+      const key = (pm[1] ?? pm[2] ?? "").trim()
+      if (!key) continue
+      args[key] = coerceXmlParamValue(pm[3] ?? "", typeMap?.get(key))
+    }
+    out.push({ name, arguments: JSON.stringify(args) })
+  }
+  return out
 }
 
 function parseToolCallJson(rawJson) {
@@ -538,12 +779,23 @@ function parseToolCallJson(rawJson) {
   return null
 }
 
+function parseToolBlock(openTag, inner, paramTypeMap) {
+  if (openTag === "<tool_call>") {
+    const jsonCall = parseToolCallJson(inner)
+    if (jsonCall) return [jsonCall]
+  }
+  const xmlCalls = parseInvokeBlocks(inner, paramTypeMap)
+  return xmlCalls.length ? xmlCalls : null
+}
+
 /**
- * Stateful splitter for `<tool_call>...</tool_call>` blocks inside streamed text chunks.
+ * Stateful splitter for `<tool_call>...</tool_call>` and `<function_calls><invoke>...</function_calls>`
+ * blocks inside streamed text chunks.
  */
-export function createToolCallSplitter(enabled) {
+export function createToolCallSplitter(enabled, tools = []) {
+  const paramTypeMap = buildParamTypeMap(tools)
   let buf = ""
-  let inTag = false
+  let activePair = null
   let toolIndex = 0
   const calls = []
 
@@ -556,12 +808,20 @@ export function createToolCallSplitter(enabled) {
     }
     buf += delta
     while (buf.length > 0) {
-      if (!inTag) {
-        const idx = buf.indexOf(OPEN_TAG)
-        if (idx >= 0) {
-          if (idx > 0) textPieces.push(buf.slice(0, idx))
-          buf = buf.slice(idx + OPEN_TAG.length)
-          inTag = true
+      if (!activePair) {
+        let bestIdx = -1
+        let bestPair = null
+        for (const pair of TAG_PAIRS) {
+          const idx = buf.indexOf(pair[0])
+          if (idx >= 0 && (bestIdx < 0 || idx < bestIdx)) {
+            bestIdx = idx
+            bestPair = pair
+          }
+        }
+        if (bestPair) {
+          if (bestIdx > 0) textPieces.push(buf.slice(0, bestIdx))
+          buf = buf.slice(bestIdx + bestPair[0].length)
+          activePair = bestPair
           continue
         }
         if (flushAll) {
@@ -569,7 +829,7 @@ export function createToolCallSplitter(enabled) {
           buf = ""
           break
         }
-        const hold = longestSuffixPrefix(buf, OPEN_TAG)
+        const hold = maxOpenTagHold(buf)
         const safeLen = buf.length - hold
         if (safeLen > 0) {
           textPieces.push(buf.slice(0, safeLen))
@@ -577,30 +837,33 @@ export function createToolCallSplitter(enabled) {
         }
         break
       } else {
-        const idx = buf.indexOf(CLOSE_TAG)
+        const [openTag, closeTag] = activePair
+        const idx = buf.indexOf(closeTag)
         if (idx >= 0) {
           const inner = buf.slice(0, idx)
-          buf = buf.slice(idx + CLOSE_TAG.length)
-          inTag = false
-          const parsed = parseToolCallJson(inner)
-          if (parsed) {
-            const call = {
-              index: toolIndex++,
-              id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-              type: "function",
-              function: parsed,
+          buf = buf.slice(idx + closeTag.length)
+          activePair = null
+          const parsedList = parseToolBlock(openTag, inner, paramTypeMap)
+          if (parsedList) {
+            for (const parsed of parsedList) {
+              const call = {
+                index: toolIndex++,
+                id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+                type: "function",
+                function: parsed,
+              }
+              calls.push(call)
+              toolCalls.push(call)
             }
-            calls.push(call)
-            toolCalls.push(call)
           } else {
-            textPieces.push(OPEN_TAG + inner + CLOSE_TAG)
+            textPieces.push(openTag + inner + closeTag)
           }
           continue
         }
         if (flushAll) {
-          textPieces.push(OPEN_TAG + buf)
+          textPieces.push(openTag + buf)
           buf = ""
-          inTag = false
+          activePair = null
         }
         break
       }
@@ -627,13 +890,39 @@ function isAuthErrorText(msg) {
 
 /**
  * Execute an SNCS chat turn over WebSocket (`AIDP` or `Gateway`), returning either a streaming SSE Response
- * or a completed OpenAI JSON Response. Rejects before returning a streaming Response if auth/handshake fails.
+ * or a completed OpenAI JSON Response. Reuses cached `threadId` incrementally when the prefix matches,
+ * transparently falling back to a fresh `threadId` if a resumed thread fails before streaming begins.
  */
-export function executeSncsChat(a, openaiBody, opts = {}) {
+export async function executeSncsChat(a, openaiBody, opts = {}) {
   const WS = opts.WebSocket ?? globalThis.WebSocket
   if (typeof WS !== "function") {
     throw new Error("Global WebSocket is unavailable in this runtime (requires Node 22+ / Electron)")
   }
+  const threadStore = opts.threadStore === undefined ? DEFAULT_THREAD_STORE : opts.threadStore
+  const stateful = opts.stateful !== false && !opts.disableResume && !opts.threadId && !!threadStore
+  const accountKey = accountKeyOf(a)
+
+  let resumeState = null
+  if (stateful) {
+    const probe = openaiToSncsRequest(openaiBody, { ...opts, disableResume: true })
+    const rawMessages = Array.isArray(openaiBody?.messages) ? openaiBody.messages : []
+    const convo = rawMessages.filter((m) => m && typeof m === "object" && !["system", "developer"].includes(String(m.role || "user").toLowerCase()))
+    resumeState = threadStore.lookup(accountKey, opts.sessionId || "", probe.envSig, convo)
+  }
+
+  try {
+    return await runSncsTurn(a, openaiBody, { ...opts, resumeState, accountKey, threadStore, WS })
+  } catch (err) {
+    if (resumeState && err?.status !== 401 && !opts.signal?.aborted) {
+      threadStore.invalidate(accountKey, opts.sessionId || "", resumeState.threadId)
+      return await runSncsTurn(a, openaiBody, { ...opts, resumeState: null, accountKey, threadStore, WS })
+    }
+    throw err
+  }
+}
+
+function runSncsTurn(a, openaiBody, ctx) {
+  const { WS, accountKey, threadStore, ...opts } = ctx
   const gateway = isGatewayProvider(a.providerType)
   const reqPlan = openaiToSncsRequest(openaiBody, opts)
   const wsHost = a.wsHost || hostFromUrl(a.tenantUrl)
@@ -680,7 +969,7 @@ export function executeSncsChat(a, openaiBody, opts = {}) {
     let usageInfo = null
     let sseController = null
     let settledInitial = false
-    const splitter = createToolCallSplitter(reqPlan.hasTools)
+    const splitter = createToolCallSplitter(reqPlan.hasTools, openaiBody?.tools)
     const sseEnc = new TextEncoder()
 
     const cleanup = () => {
@@ -730,12 +1019,30 @@ export function executeSncsChat(a, openaiBody, opts = {}) {
       }
     }
 
+    const commitThreadState = () => {
+      if (!threadStore || opts.stateful === false || !reqPlan.convoHashes?.length) return
+      const assistantContent = splitter.calls.length && !accumulatedContent ? null : accumulatedContent
+      const expectedAssistantSig = messageDigest({
+        role: "assistant",
+        content: assistantContent,
+        tool_calls: splitter.calls,
+      })
+      threadStore.commit(accountKey, opts.sessionId || "", {
+        threadId: reqPlan.threadId,
+        workingSessionId: reqPlan.workingSessionId,
+        envSig: reqPlan.envSig,
+        msgHashes: reqPlan.convoHashes,
+        expectedAssistantSig,
+      })
+    }
+
     const completeSuccess = () => {
       if (finished) return
       finished = true
       const flushed = splitter.flush()
       if (flushed.text) accumulatedContent += flushed.text
       const finishReason = splitter.calls.length > 0 ? "tool_calls" : "stop"
+      commitThreadState()
       const openAiUsage = usageInfo
         ? {
             prompt_tokens: Number(usageInfo.input_tokens) || 0,
@@ -838,7 +1145,7 @@ export function executeSncsChat(a, openaiBody, opts = {}) {
       if (type === "keepalive" || type === "pong") return
       if (type === "session_established" || type === "connected") {
         handshakeReady = true
-        if (reqPlan.stream && !settledInitial) openSseStream()
+        if (reqPlan.stream && !reqPlan.isResume && !settledInitial) openSseStream()
         return
       }
       if (
