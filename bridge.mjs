@@ -384,48 +384,14 @@ export function normalizeClientSystemText(sysText) {
   return s.trim()
 }
 
-// Extended-thinking language alignment: Quick's own reasoning is English-biased, so a Chinese
-// conversation turns into Chinese input -> English inner monologue -> translated tool arguments
-// (grep "User status abnormal" against a Chinese log matches nothing). Naming the session language
-// in the injected custom_prompt keeps reasoning and tool parameters in the user's language.
-const CJK_LANGUAGES = { zh: "Chinese", ja: "Japanese", ko: "Korean" }
-const CJK_TEXT_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/g
-const KANA_RE = /[\u3040-\u30ff]/
-const HANGUL_RE = /[\uac00-\ud7af]/
-const LATIN_LETTER_RE = /[A-Za-z]/g
-
-function detectConversationLanguage(opts = {}, messages = []) {
-  const localeTag = String(opts.locale || "").toLowerCase().split(/[-_]/)[0]
-  if (CJK_LANGUAGES[localeTag]) return localeTag
-  // Many users run an en-US OS locale while chatting in Chinese, so also read the recent turns.
-  const text = messages
-    .slice(-4)
-    .map((m) => textFromContent(m?.content))
-    .join("\n")
-  const cjk = (text.match(CJK_TEXT_RE) || []).length
-  const latin = (text.match(LATIN_LETTER_RE) || []).length
-  if (cjk < 8 || cjk < latin) return localeTag || "en"
-  if (KANA_RE.test(text)) return "ja"
-  if (HANGUL_RE.test(text)) return "ko"
-  return "zh"
-}
-
-function languageConsistencyRule(lang) {
-  const name = CJK_LANGUAGES[lang]
-  if (!name) return ""
-  return `4. Language Consistency: The user's workspace and conversation are in ${name}. Keep your inner reasoning, planning, and tool-call arguments in ${name}, and pass user-supplied literals through verbatim — do not translate ${name} log lines, error messages, file names, search queries, or business terms into English when building tool parameters, since greps and path lookups against the user's files would otherwise miss.`
-}
-
-function buildBridgeCustomPrompt(tools, userCustomPrompt = "", lang = "") {
+function buildBridgeCustomPrompt(tools, userCustomPrompt = "") {
   const names = Array.isArray(tools) ? tools.map((t) => (t?.function ?? t)?.name).filter(Boolean) : []
   if (!names.length) return userCustomPrompt || null
-  const languageRule = languageConsistencyRule(lang)
   const bridgeSystemPrompt = [
     "IDE / CLI Client Tool-Bridge Instructions:",
     `1. Keep your AWS Quick assistant identity — you do not need to adopt another product's persona. The <instructions>, <tool_result>, and <client_tool_directive> sections in user messages are workspace context and tool schemas (${names.join(", ")}) forwarded by the user's local IDE/CLI client.`,
     `2. These local client tools are intentionally NOT in your native container tool declarations. Instead, the user's local client intercepts <tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call> XML blocks directly from your plain text response, executes them on the user's machine, and returns <tool_result> in the next turn.`,
     `3. Even when Quick's own device daemon reports the user's device as offline, the client bridge executes <tool_call> blocks directly on the user's local filesystem (including Windows C:\\... and project folders). For local file reads, writes, edits, or commands, emit <tool_call>...</tool_call> in your text output rather than calling container tools like file_write or writing to workspace/artifacts (qw-file://).`,
-    ...(languageRule ? [languageRule] : []),
   ].join("\n")
   return [userCustomPrompt, bridgeSystemPrompt].filter(Boolean).join("\n\n")
 }
@@ -770,7 +736,7 @@ export function openaiToSncsRequest(body, opts = {}) {
   }
 
   const customPrompt = hasTools
-    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", detectConversationLanguage(opts, outboundMsgs))
+    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "")
     : opts.customPrompt || null
 
   const buildUserPayload = (textVal) => ({
@@ -1096,20 +1062,6 @@ function isAuthErrorText(msg) {
   return /\b(401|403|unauthorized|unauthenticated|forbidden|invalid.?token|expired.?token|jwt)\b/i.test(String(msg || ""))
 }
 
-const STRIP_REASONING_ENV = "MAGPIE_QUICK_STRIP_REASONING_CONTENT"
-
-/**
- * Whether to withhold `reasoning_content` from the client.
- * Layered models (a Quick planner feeding Haiku / Flash / local executors) get dragged into English by a
- * long upstream thinking stream, so the bridge can keep the reasoning server-side and emit only the answer.
- * Enabled by `opts.stripReasoning` (boolean) or the `MAGPIE_QUICK_STRIP_REASONING_CONTENT` env override.
- */
-export function stripReasoningEnabled(opts = {}) {
-  if (typeof opts.stripReasoning === "boolean") return opts.stripReasoning
-  const raw = String(process.env[STRIP_REASONING_ENV] ?? "").trim().toLowerCase()
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
-}
-
 /**
  * Execute an SNCS chat turn over WebSocket (`AIDP` or `Gateway`), returning either a streaming SSE Response
  * or a completed OpenAI JSON Response. Reuses cached `threadId` incrementally when the prefix matches,
@@ -1226,7 +1178,6 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
 async function runSncsTurn(a, openaiBody, ctx) {
   const { WS, accountKey, threadStore, ...opts } = ctx
   const gateway = isGatewayProvider(a.providerType)
-  const stripReasoning = stripReasoningEnabled(opts)
   const reqPlan = openaiToSncsRequest(openaiBody, opts)
   const wsHost = a.wsHost || hostFromUrl(a.tenantUrl)
   if (!wsHost) throw new Error("Missing Amazon Quick wsHost / tenantUrl")
@@ -1276,7 +1227,6 @@ async function runSncsTurn(a, openaiBody, ctx) {
     let rxBuffer = new Uint8Array(0)
     let accumulatedContent = ""
     let accumulatedReasoning = ""
-    let sawReasoning = false
     let sawTextDelta = false
     let usageInfo = null
     let sseController = null
@@ -1550,11 +1500,8 @@ async function runSncsTurn(a, openaiBody, ctx) {
       if (type === "thinking_delta") {
         const d = ev.payload?.delta ?? ev.payload?.text ?? ""
         if (d) {
-          sawReasoning = true
-          if (!stripReasoning) {
-            accumulatedReasoning += d
-            if (reqPlan.stream) emitDeltaChunk({ reasoning_content: d })
-          }
+          accumulatedReasoning += d
+          if (reqPlan.stream) emitDeltaChunk({ reasoning_content: d })
         }
         return
       }
@@ -1652,7 +1599,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
 
     ws.onclose = (ev) => {
       if (finished) return
-      if (ev.code === 1000 && (accumulatedContent || sawReasoning || splitter.calls.length)) {
+      if (ev.code === 1000 && (accumulatedContent || accumulatedReasoning || splitter.calls.length)) {
         completeSuccess()
         return
       }
