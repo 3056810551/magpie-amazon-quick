@@ -1,4 +1,4 @@
-# opencode-amazon-quick-auth
+# magpie-amazon-quick
 
 [中文](#中文说明) | [English](#english)
 
