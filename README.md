@@ -74,6 +74,15 @@ https://github.com/3056810551/magpie-amazon-quick
 ## 环境变量
 
 - `QUICKWORK_DIR` / `AWS_QUICK_DIR`：覆盖默认的 `~/.quickwork` 配置目录路径。
+- `MAGPIE_QUICK_STRIP_REASONING_CONTENT`：设为 `1` / `true` / `yes` / `on` 时，桥接层不再向调用方下发 `reasoning_content`（思维链仍在上游生成，只是不返回）。等价于调用 `executeSncsChat` 时传 `stripReasoning: true`，显式传参会覆盖环境变量。
+
+## 思维链语言对齐
+
+以中文 / 日文 / 韩文会话时，桥接会自动在注入的 `custom_prompt` 中追加一条 `Language Consistency` 规则，要求模型用会话语言完成内心推理，并**原样透传**用户提供的日志行、报错文案、文件名与检索词来构造工具实参——避免“中文输入 → 英文默想 → 翻回英文参数”后 `grep` / 路径匹配全部落空。
+
+语言判定先看请求的 `locale`，再看最近几轮对话是否以 CJK 文本为主；因此系统区域为 `en-US` 但用中文提问时同样生效，纯英文会话则完全不受影响（提示词与旧版一致）。
+
+若下游是较小的执行模型（Haiku / Flash / 本地模型），长英文思维流容易把它带偏（注释变英文、commit message 变英文），可配合上面的 `MAGPIE_QUICK_STRIP_REASONING_CONTENT` 一起使用。
 
 ## 测试
 
@@ -156,6 +165,15 @@ When monthly overage (`overage_monthly`) is enabled on an account, it is display
 ## Environment Overrides
 
 - `QUICKWORK_DIR` / `AWS_QUICK_DIR`: Override the default `~/.quickwork` profile directory path.
+- `MAGPIE_QUICK_STRIP_REASONING_CONTENT`: Set to `1` / `true` / `yes` / `on` to withhold `reasoning_content` from callers (thinking still happens upstream, it just isn't returned). Equivalent to passing `stripReasoning: true` to `executeSncsChat`; the explicit option wins over the env var.
+
+## Reasoning Language Alignment
+
+For Chinese / Japanese / Korean sessions the bridge appends a `Language Consistency` rule to the injected `custom_prompt`, asking the model to reason in the session language and to pass user-supplied log lines, error text, file names, and search terms through **verbatim** when building tool arguments — otherwise "Chinese input → English inner monologue → translated arguments" makes greps and path lookups miss entirely.
+
+The language is detected from the request `locale` first, then from whether the recent turns are mostly CJK text, so a Chinese conversation on an `en-US` system locale still aligns, while an English conversation keeps the previous prompt unchanged.
+
+When the downstream consumer is a smaller executor model (Haiku / Flash / a local model), a long English thinking stream tends to drag it along (English comments, English commit messages); combine this with `MAGPIE_QUICK_STRIP_REASONING_CONTENT` above.
 
 ## Tests
 

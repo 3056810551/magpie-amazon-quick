@@ -37,6 +37,7 @@ import {
   modelsFromSettings,
   openaiToSncsRequest,
   resolveModelAndEffort,
+  stripReasoningEnabled,
 } from "./bridge.mjs"
 import { createAmazonQuickPlugin } from "./index.mjs"
 import * as opencode1 from "./opencode.mjs"
@@ -419,6 +420,90 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.ok(hugeReq.userMessagePayload.text.includes("Final task: edit_file douban_spider.py now"))
   assert.ok(hugeReq.userMessagePayload.text.includes("tool_29(path*: string"))
   assert.ok(hugeReq.userMessagePayload.text.endsWith("</client_tool_directive>"))
+})
+
+test("CJK sessions get a language-consistency rule and reasoning_content can be stripped", async () => {
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    },
+  ]
+  const ask = (content, locale) =>
+    openaiToSncsRequest({ model: "smart", tools, messages: [{ role: "user", content }] }, { locale }).userMessagePayload
+      .custom_prompt
+
+  // Chinese locale injects the alignment rule naming the session language.
+  assert.ok(ask("排查日志", "zh-CN").includes("Language Consistency"))
+  assert.ok(ask("排查日志", "zh-CN").includes("Chinese"))
+  // Japanese / Korean locales are named too.
+  assert.ok(ask("ログを調べて", "ja-JP").includes("Japanese"))
+  assert.ok(ask("로그를 확인해줘", "ko-KR").includes("Korean"))
+  // English conversation keeps the previous prompt byte-for-byte (no reasoning-language constraint).
+  const en = ask("find the error in the log", "en-US")
+  assert.ok(!en.includes("Language Consistency"))
+  // Chinese content on an en-US OS locale still aligns, since the rule follows the content.
+  assert.ok(ask("请帮我排查日志中「用户状态异常，禁止登录」的报错原因，并给出修复建议", "en-US").includes("Language Consistency"))
+
+  // stripReasoning: explicit option wins, env override applies otherwise.
+  const saved = process.env.MAGPIE_QUICK_STRIP_REASONING_CONTENT
+  try {
+    delete process.env.MAGPIE_QUICK_STRIP_REASONING_CONTENT
+    assert.equal(stripReasoningEnabled({}), false)
+    assert.equal(stripReasoningEnabled({ stripReasoning: true }), true)
+    assert.equal(stripReasoningEnabled({ stripReasoning: false }), false)
+    process.env.MAGPIE_QUICK_STRIP_REASONING_CONTENT = "1"
+    assert.equal(stripReasoningEnabled({}), true)
+    assert.equal(stripReasoningEnabled({ stripReasoning: false }), false)
+  } finally {
+    if (saved === undefined) delete process.env.MAGPIE_QUICK_STRIP_REASONING_CONTENT
+    else process.env.MAGPIE_QUICK_STRIP_REASONING_CONTENT = saved
+  }
+
+  const acct = {
+    providerType: "social",
+    access: "tok-live",
+    tenantUrl: "https://qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+  }
+  const makeWS = () =>
+    makeMockWebSocketClass((ws) => {
+      ws.readyState = 1
+      ws.onopen?.()
+      queueMicrotask(() => {
+        ws.emitAidpEvent({ type: "session_established", payload: {} })
+        ws.emitAidpEvent({ type: "message_start", payload: {} })
+        ws.emitAidpEvent({ type: "thinking_delta", payload: { delta: "The user wants me to grep the log" } })
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "日志里没有匹配项。" } })
+        ws.emitAidpEvent({ type: "message_complete", payload: {} })
+      })
+    })
+  const body = { model: "fast", messages: [{ role: "user", content: "排查日志" }] }
+
+  // Streamed: thinking stays server-side, answer still streams.
+  const strippedSse = await (
+    await executeSncsChat(acct, { ...body, stream: true }, { WebSocket: makeWS(), stateful: false, stripReasoning: true })
+  ).text()
+  assert.ok(!strippedSse.includes("reasoning_content"))
+  assert.ok(strippedSse.includes("日志里没有匹配项。"))
+  assert.ok(strippedSse.includes("data: [DONE]"))
+
+  // Default: reasoning is still forwarded to the caller.
+  const keptSse = await (
+    await executeSncsChat(acct, { ...body, stream: true }, { WebSocket: makeWS(), stateful: false })
+  ).text()
+  assert.ok(keptSse.includes('"reasoning_content":"The user wants me to grep the log"'))
+
+  // Non-streamed: the completed message carries no reasoning_content when stripped.
+  const strippedJson = await (
+    await executeSncsChat(acct, { ...body, stream: false }, { WebSocket: makeWS(), stateful: false, stripReasoning: true })
+  ).json()
+  assert.equal(strippedJson.choices[0].message.content, "日志里没有匹配项。")
+  assert.equal(strippedJson.choices[0].message.reasoning_content, undefined)
+  assert.equal(strippedJson.choices[0].finish_reason, "stop")
 })
 
 function makeMockWebSocketClass(responder) {
