@@ -326,7 +326,8 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.equal(sncs.userMessagePayload.web_search_enabled, true)
   assert.equal(sncs.sessionConnectPayload.outpostId, undefined)
   assert.equal(sncs.userMessagePayload.outpostId, undefined)
-  assert.equal(sncs.userMessagePayload.custom_prompt, null)
+  assert.ok(sncs.userMessagePayload.custom_prompt.includes("IDE Client Tool-Bridge System Instructions"))
+  assert.ok(sncs.userMessagePayload.custom_prompt.includes("read_file"))
   assert.ok(sncs.userMessagePayload.text.includes("<instructions>"))
   assert.ok(sncs.userMessagePayload.text.includes("Be concise."))
   assert.ok(sncs.userMessagePayload.text.includes("CLIENT TOOL CALLING PROTOCOL"))
@@ -789,8 +790,8 @@ test("stateful thread_id incremental continuation reuses threads, isolates accou
   assert.equal(t1Connect.session_id, undefined)
   assert.ok(t1Msg.text.includes("SYSTEM_PROMPT_V1"))
 
-  // Turn 2 (no sessionId header): matches head index, reuses thread_id and omits <instructions>
-  const a1 = r1.choices[0].message
+  // Turn 2 (no sessionId header, IDE mutates assistant content): matches tool_call_id / head index, reuses thread_id and omits <instructions>
+  const a1 = { ...r1.choices[0].message, content: "IDE reformatted assistant preface" }
   const tr1 = { role: "tool", tool_call_id: a1.tool_calls[0].id, content: "SECRET_LINE" }
   const r2 = await (await executeSncsChat(acctA, { model: "fast", stream: false, tools, messages: [sys, u1, a1, tr1] }, { WebSocket: MockWS, threadStore: store })).json()
   const t2Connect = sentFrames[1].find((f) => f.type === "session_connect").payload
