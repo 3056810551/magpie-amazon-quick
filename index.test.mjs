@@ -704,7 +704,7 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
   })
   assert.equal(addedMethods.length, 4)
   assert.equal(addedMethods[0].integrationID, "amazon-quick")
-  assert.match(addedMethods[2].method.label, /Device Code/i)
+  assert.match(addedMethods[2].method.label, /设备码登录/)
   assert.equal(addedMethods[2].method.form?.every((f) => !f.required), true)
   assert.equal(addedProviders[0].info.id, "amazon-quick")
 
@@ -1300,9 +1300,10 @@ test("macOS Keychain timeout/denied negative cache, actionable errors, and brows
 
     // 2. Auth methods list puts browser OIDC first and labels macOS Keychain caveat on desktop sign-in
     const macPlugin = await createAmazonQuickPlugin({ platform: "darwin" })({})
-    assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick account (browser)")
-    assert.match(macPlugin.auth.methods[1].label, /macOS: requires Keychain password/i)
-    assert.match(macPlugin.auth.methods[2].label, /Device Code/i)
+    assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick 浏览器登录（推荐）")
+    assert.match(macPlugin.auth.methods[1].label, /macOS 需钥匙串密码/)
+    assert.match(macPlugin.auth.methods[2].label, /设备码登录/)
+    assert.match(macPlugin.auth.methods[3].label, /企业版 \/ 自定义 OIDC/)
   } finally {
     clearDesktopCache()
     rmSync(dir, { recursive: true, force: true })

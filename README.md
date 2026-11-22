@@ -39,17 +39,17 @@ https://github.com/3056810551/magpie-amazon-quick
 
 ## 登录方式
 
-1. **Amazon Quick account (browser)** *（推荐，尤其在 macOS 上：一键浏览器授权，独立会话，不触碰系统钥匙串）*
+1. **Amazon Quick 浏览器登录（推荐）** *（尤其在 macOS 上：一键浏览器授权，独立会话，不触碰系统钥匙串）*
    - 直接打开浏览器前往 AWS IAM Identity Center（支持 Google / Amazon / Builder ID 等登录），完成授权后自动回传独立的 `access_token` 与 `refresh_token`，不依赖桌面端保持运行（`tenantUrl` 会从本机 `~/.quickwork/profiles.json` 自动识别）。
    - **若浏览器打开后提示 `Your session has expired`**：通常是浏览器里残留了过期的 AWS Builder ID 会话 Cookie（`signin.aws`）。在浏览器地址栏左侧进入「Cookie 和网站数据 → 管理设备上的网站数据」（或 Chrome 打开 `chrome://settings/content/all?searchSubpage=signin.aws`）清除 `signin.aws` / `us-east-1.signin.aws` 的全部 Cookie 后重试即可；也可将授权链接复制到无痕窗口打开完成登录。
-2. **Amazon Quick desktop's sign-in** *（复用桌面端登录；Windows / Linux 开箱即用，macOS 会触发钥匙串授权）*
+2. **复用 Amazon Quick 桌面端登录** *（Windows / Linux 开箱即用，macOS 会触发钥匙串授权）*
    - 自动复用当前桌面端已登录账号，不会改动磁盘或凭据库中的刷新令牌。
    - 若桌面端关闭期间访问令牌过期，只需打开一次 Amazon Quick 桌面端（或在桌面端重新登录），插件会在下次请求时自动读取更新后的令牌。
-   - **macOS 注意**：Quick 桌面端写入 Keychain 的条目仅信任自身 ACL，首次通过 `security` 读取需输入登录密码并点击**「始终允许」**；当 Quick 桌面端刷新并重建条目后 ACL 会重置，可能需要再次授权。macOS 强烈推荐使用方式 1（网页登录）、方式 3（设备码）或方式 5（JSON 导入）以避免弹框。
-3. **Amazon Quick Device Code (VPS / Remote / Headless)** *（VPS / Docker / 远程 Magpie 网页端推荐，无需 `127.0.0.1` 回调）*
+   - **macOS 注意**：Quick 桌面端写入 Keychain 的条目仅信任自身 ACL，首次通过 `security` 读取需输入登录密码并点击**「始终允许」**；当 Quick 桌面端刷新并重建条目后 ACL 会重置，可能需要再次授权。macOS 强烈推荐使用方式 1（浏览器登录）、方式 3（设备码登录）或方式 5（JSON 导入）以避免弹框。
+3. **Amazon Quick 设备码登录（VPS / 远程网页端推荐）** *（无需 `127.0.0.1` 回调）*
    - 适用于服务器未安装桌面端、在本地电脑浏览器打开远程 Magpie 网页端的场景。
    - 填入账号对应的 `tenantUrl` 与 `issuerUrl`（可从任意登录过桌面端的电脑 `~/.quickwork/profiles.json` 中复制 `tenant_url` 和 `issuer_url`；注意不同账号所在 cell 的两个 URL 需配对使用），随后在任意设备浏览器打开返回的 AWS 授权链接确认即可，服务端会自动轮询换取独立的 `access_token` 与 `refresh_token`。
-4. **Amazon Quick Enterprise / Custom OIDC (browser)**
+4. **Amazon Quick 企业版 / 自定义 OIDC（浏览器）**
    - 用于尚未在本地登录过桌面端或需要指定企业专属 `issuerUrl` / `tenantUrl` 的本机场景，手动填入后在浏览器完成 OIDC PKCE 登录。
 5. **Import accounts from a file…**（Magpie）
    - 导入包含 Amazon Quick 凭证字段（如 `access_token`、`refresh_token`、`client_id`、`issuer_url`、`tenant_url`）的 JSON 文件（亦可用于本地登录后直接导入到 VPS）。

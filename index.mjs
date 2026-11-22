@@ -161,34 +161,32 @@ export function createAmazonQuickPlugin(deps = {}) {
         methods: [
           {
             type: "oauth",
-            label: `${PROVIDER_NAME} account (browser)`,
+            label: `${PROVIDER_NAME} 浏览器登录（推荐）`,
             authorize: () => runBrowserSignIn({}, deps),
           },
           {
             type: "oauth",
             label:
               (deps.platform ?? process.platform) === "darwin"
-                ? `${PROVIDER_NAME} desktop's sign-in (macOS: requires Keychain password)`
-                : `${PROVIDER_NAME} desktop's sign-in`,
+                ? `复用 ${PROVIDER_NAME} 桌面端登录（macOS 需钥匙串密码）`
+                : `复用 ${PROVIDER_NAME} 桌面端登录`,
             authorize: async () => runDesktopSignIn(deps),
           },
           {
             type: "oauth",
-            label: `${PROVIDER_NAME} Device Code (VPS / Remote / Headless)`,
+            label: `${PROVIDER_NAME} 设备码登录（VPS / 远程网页端推荐）`,
             prompts: [
               {
                 type: "text",
                 key: "tenantUrl",
-                message:
-                  "Amazon Quick Tenant URL (copy tenant_url from ~/.quickwork/profiles.json; leave blank if desktop is installed here)",
+                message: "Amazon Quick Tenant URL（从 ~/.quickwork/profiles.json 复制 tenant_url；本机已装桌面端可留空）",
                 placeholder: "https://qbs-...dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
                 required: false,
               },
               {
                 type: "text",
                 key: "issuerUrl",
-                message:
-                  "AWS IAM Identity Center Issuer URL (copy issuer_url from ~/.quickwork/profiles.json; leave blank for default)",
+                message: "AWS IAM Identity Center Issuer URL（从 ~/.quickwork/profiles.json 复制 issuer_url；留空使用默认值）",
                 placeholder: "https://identitycenter.amazonaws.com/ssoins-...",
                 required: false,
               },
@@ -197,19 +195,19 @@ export function createAmazonQuickPlugin(deps = {}) {
           },
           {
             type: "oauth",
-            label: `${PROVIDER_NAME} Enterprise / Custom OIDC (browser)`,
+            label: `${PROVIDER_NAME} 企业版 / 自定义 OIDC（浏览器）`,
             prompts: [
               {
                 type: "text",
                 key: "issuerUrl",
-                message: "AWS IAM Identity Center Issuer URL (leave blank for default Social SSO)",
+                message: "AWS IAM Identity Center Issuer URL（留空使用默认 Social SSO）",
                 placeholder: "https://identitycenter.amazonaws.com/ssoins-...",
                 required: false,
               },
               {
                 type: "text",
                 key: "tenantUrl",
-                message: "Amazon Quick Tenant URL (e.g. https://qbs-....dp.appintegrations.us-east-1.prod.plato.ai.aws.dev)",
+                message: "Amazon Quick Tenant URL（例如 https://qbs-....dp.appintegrations.us-east-1.prod.plato.ai.aws.dev）",
                 placeholder: "https://qbs-...plato.ai.aws.dev",
               },
             ],
