@@ -239,14 +239,59 @@ function textFromContent(content) {
   return parts.join("\n")
 }
 
-function formatToolsInstruction(tools, toolChoice) {
+export const MAX_USER_MESSAGE_FRAME_BYTES = 58_000
+
+function truncateMiddle(str, maxChars, marker = "\n...[trimmed to fit frame limit]...\n") {
+  const s = String(str ?? "")
+  if (s.length <= maxChars) return s
+  if (maxChars <= marker.length + 16) return s.slice(0, Math.max(0, maxChars))
+  const head = Math.floor((maxChars - marker.length) * 0.65)
+  const tail = maxChars - marker.length - head
+  return s.slice(0, head) + marker + s.slice(s.length - tail)
+}
+
+function summarizeSchema(schema, depth = 0) {
+  if (!schema || typeof schema !== "object") return "any"
+  if (Array.isArray(schema.enum) && schema.enum.length) {
+    return schema.enum.slice(0, 8).map((v) => JSON.stringify(v)).join("|")
+  }
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length) {
+    return schema.anyOf.slice(0, 4).map((b) => summarizeSchema(b, depth + 1)).join("|")
+  }
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length) {
+    return schema.oneOf.slice(0, 4).map((b) => summarizeSchema(b, depth + 1)).join("|")
+  }
+  if (schema.type === "array") {
+    return `array<${summarizeSchema(schema.items, depth + 1)}>`
+  }
+  if (schema.type === "object" || (schema.properties && typeof schema.properties === "object")) {
+    const props = schema.properties && typeof schema.properties === "object" ? Object.entries(schema.properties) : []
+    if (!props.length || depth >= 2) return "object"
+    const req = new Set(Array.isArray(schema.required) ? schema.required : [])
+    const fields = props.slice(0, 12).map(([k, v]) => `${k}${req.has(k) ? "*" : ""}: ${summarizeSchema(v, depth + 1)}`)
+    if (props.length > 12) fields.push("...")
+    return `{${fields.join(", ")}}`
+  }
+  if (Array.isArray(schema.type)) return schema.type.join("|")
+  return String(schema.type || "any")
+}
+
+function formatToolsInstruction(tools, toolChoice, compact = false) {
   if (!Array.isArray(tools) || tools.length === 0) return ""
   const defs = tools
     .map((t) => {
       const fn = t?.function ?? t
       if (!fn?.name) return null
-      const params = fn.parameters ? JSON.stringify(fn.parameters) : "{}"
-      return `- ${fn.name}${fn.description ? `: ${fn.description}` : ""}\n  Parameters JSON Schema: ${params}`
+      if (!compact) {
+        const params = fn.parameters ? JSON.stringify(fn.parameters) : "{}"
+        return `- ${fn.name}${fn.description ? `: ${fn.description}` : ""}\n  Parameters JSON Schema: ${params}`
+      }
+      const paramsObj = fn.parameters && typeof fn.parameters === "object" ? fn.parameters : {}
+      const props = paramsObj.properties && typeof paramsObj.properties === "object" ? Object.entries(paramsObj.properties) : []
+      const req = new Set(Array.isArray(paramsObj.required) ? paramsObj.required : [])
+      const sig = props.map(([k, v]) => `${k}${req.has(k) ? "*" : ""}: ${summarizeSchema(v, 0)}`).join(", ")
+      const desc = fn.description ? String(fn.description).replace(/\s+/g, " ").trim().slice(0, 140) : ""
+      return `- ${fn.name}(${sig})${desc ? `: ${desc}` : ""}`
     })
     .filter(Boolean)
   if (!defs.length) return ""
@@ -288,12 +333,13 @@ function formatTrailingToolDirective(tools, toolChoice) {
 }
 
 /**
- * Convert an OpenAI `/chat/completions` JSON request body into SNCS `user_message` fields.
+ * Convert an OpenAI `/chat/completions` JSON request body into SNCS `user_message` fields,
+ * compacting schemas and older turns when necessary so the outbound SNCS frame stays under the 64 KB limit.
  */
 export function openaiToSncsRequest(body, opts = {}) {
   const { modelId, agentMode, autoRouting, thinkingEffort } = resolveModelAndEffort(body?.model, body)
   const messages = Array.isArray(body?.messages) ? body.messages : []
-  const systemParts = []
+  const rawSystemParts = []
   const convoMessages = []
 
   for (const msg of messages) {
@@ -301,7 +347,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     const role = String(msg.role || "user").toLowerCase()
     if (role === "system" || role === "developer") {
       const t = textFromContent(msg.content).trim()
-      if (t) systemParts.push(t)
+      if (t) rawSystemParts.push(t)
     } else {
       convoMessages.push(msg)
     }
@@ -310,14 +356,14 @@ export function openaiToSncsRequest(body, opts = {}) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
   const toolChoice = body?.tool_choice
   const hasTools = tools.length > 0 && toolChoice !== "none"
-  const toolsPrompt = hasTools ? formatToolsInstruction(tools, toolChoice) : ""
-  if (toolsPrompt) systemParts.push(toolsPrompt)
+  const fullToolsPrompt = hasTools ? formatToolsInstruction(tools, toolChoice, false) : ""
+  const compactToolsPrompt = hasTools ? formatToolsInstruction(tools, toolChoice, true) : ""
+  const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice) : ""
 
-  let text = ""
+  let convoBlocks = []
   if (convoMessages.length === 1 && String(convoMessages[0].role).toLowerCase() === "user" && !convoMessages[0].tool_calls?.length) {
-    text = textFromContent(convoMessages[0].content)
+    convoBlocks = [textFromContent(convoMessages[0].content)]
   } else {
-    const blocks = []
     for (const msg of convoMessages) {
       const role = String(msg.role || "user").toLowerCase()
       if (role === "assistant") {
@@ -335,25 +381,16 @@ export function openaiToSncsRequest(body, opts = {}) {
             .join("\n")
           content = content ? `${content}\n${calls}` : calls
         }
-        blocks.push(`Assistant:\n${content}`)
+        convoBlocks.push(`Assistant:\n${content}`)
       } else if (role === "tool") {
         const callId = msg.tool_call_id || msg.name || "tool"
         const nameAttr = msg.name ? ` name="${msg.name}"` : ""
-        blocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
+        convoBlocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
       } else {
-        blocks.push(`User:\n${textFromContent(msg.content)}`)
+        convoBlocks.push(`User:\n${textFromContent(msg.content)}`)
       }
     }
-    text = blocks.join("\n\n") || "Hello"
-  }
-
-  if (systemParts.length) {
-    const instructions = `<instructions>\n${systemParts.join("\n\n")}\n</instructions>`
-    text = text ? `${instructions}\n\n${text}` : instructions
-  }
-  if (hasTools) {
-    const trailing = formatTrailingToolDirective(tools, toolChoice)
-    if (trailing) text = text ? `${text}\n\n${trailing}` : trailing
+    if (!convoBlocks.length) convoBlocks = ["Hello"]
   }
 
   const outpostId = opts.outpostId || randomUUID()
@@ -367,6 +404,89 @@ export function openaiToSncsRequest(body, opts = {}) {
         ? opts.webSearchEnabled
         : true
   const surfaceType = surfaceTypeForPlatform(opts.platform)
+  const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
+
+  const composeText = (sysText, toolsText, blocks) => {
+    const instrParts = [sysText, toolsText].filter(Boolean)
+    const bodyText = blocks.filter(Boolean).join("\n\n")
+    const parts = []
+    if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
+    if (bodyText) parts.push(bodyText)
+    if (trailing) parts.push(trailing)
+    return parts.join("\n\n")
+  }
+
+  const buildUserPayload = (textVal) => ({
+    traceId: randomUUID(),
+    text: textVal,
+    surfaceType,
+    ...(opts.outpostId ? { outpostId: opts.outpostId } : {}),
+    appVersion: APP_VERSION,
+    message_id: messageId,
+    thread_id: threadId,
+    agent_mode: agentMode,
+    thinking_effort: thinkingEffort,
+    user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    user_locale: opts.locale || Intl.DateTimeFormat().resolvedOptions().locale || "en-US",
+    custom_prompt: opts.customPrompt || null,
+    chat_agent_id: null,
+    auto_routing: autoRouting,
+    web_search_enabled: webSearchEnabled,
+    incognito: true,
+  })
+
+  const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
+
+  let sysText = rawSystemParts.join("\n\n")
+  let blocks = [...convoBlocks]
+  let toolsText = fullToolsPrompt
+  let text = composeText(sysText, toolsText, blocks)
+
+  // Stage 1: Compact verbose JSON tool schemas to concise typed signatures if over limit
+  if (measure(text) > maxFrameBytes && hasTools) {
+    toolsText = compactToolsPrompt
+    text = composeText(sysText, toolsText, blocks)
+  }
+
+  // Stage 2: Trim older turns / long tool results first, preserving the latest turn & directives
+  if (measure(text) > maxFrameBytes && blocks.length > 1) {
+    for (let i = 0; i < blocks.length - 1 && measure(text) > maxFrameBytes; i++) {
+      if (blocks[i].length > 800) {
+        blocks[i] = truncateMiddle(blocks[i], 600)
+        text = composeText(sysText, toolsText, blocks)
+      }
+    }
+    while (blocks.length > 2 && measure(text) > maxFrameBytes) {
+      blocks.shift()
+      text = composeText(sysText, toolsText, blocks)
+    }
+  }
+
+  // Stage 3: Trim long system prompt text, leaving tools protocol and latest user turn intact
+  if (measure(text) > maxFrameBytes && sysText) {
+    const withoutSysBytes = measure(composeText("", toolsText, blocks))
+    const charBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
+    sysText = charBudget > 256 ? truncateMiddle(sysText, charBudget) : ""
+    text = composeText(sysText, toolsText, blocks)
+    for (let over = measure(text) - maxFrameBytes; over > 0 && sysText.length > 0; over = measure(text) - maxFrameBytes) {
+      const nextLen = sysText.length - Math.max(200, Math.ceil(over * 0.75))
+      sysText = nextLen > 256 ? truncateMiddle(sysText, nextLen) : ""
+      text = composeText(sysText, toolsText, blocks)
+    }
+  }
+
+  // Stage 4: Final safety clamp on user body text so outbound frame stays under maxFrameBytes
+  if (measure(text) > maxFrameBytes && blocks.length) {
+    let over = measure(text) - maxFrameBytes
+    let last = blocks[blocks.length - 1]
+    while (over > 0 && last.length > 256) {
+      const cut = Math.max(200, Math.floor(over * 0.75))
+      last = truncateMiddle(last, Math.max(128, last.length - cut))
+      blocks[blocks.length - 1] = last
+      text = composeText(sysText, toolsText, blocks)
+      over = measure(text) - maxFrameBytes
+    }
+  }
 
   return {
     modelId,
@@ -386,24 +506,7 @@ export function openaiToSncsRequest(body, opts = {}) {
       external_agent_sign_in: 1,
       recents_promotion: 1,
     },
-    userMessagePayload: {
-      traceId: randomUUID(),
-      text,
-      surfaceType,
-      ...(opts.outpostId ? { outpostId: opts.outpostId } : {}),
-      appVersion: APP_VERSION,
-      message_id: messageId,
-      thread_id: threadId,
-      agent_mode: agentMode,
-      thinking_effort: thinkingEffort,
-      user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-      user_locale: opts.locale || Intl.DateTimeFormat().resolvedOptions().locale || "en-US",
-      custom_prompt: opts.customPrompt || null,
-      chat_agent_id: null,
-      auto_routing: autoRouting,
-      web_search_enabled: webSearchEnabled,
-      incognito: true,
-    },
+    userMessagePayload: buildUserPayload(text),
   }
 }
 
@@ -804,7 +907,8 @@ export function executeSncsChat(a, openaiBody, opts = {}) {
       }
       if (type === "error") {
         const msg = ev.payload?.message || ev.payload?.error || ev.message || "Amazon Quick WebSocket error"
-        const status = Number(ev.payload?.status) || 502
+        const rawStatus = Number(ev.payload?.status)
+        const status = rawStatus || (/size limit|too large|too long|invalid/i.test(msg) ? 400 : 502)
         failEarly(msg, status)
         return
       }

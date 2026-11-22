@@ -30,6 +30,7 @@ import {
   configModels,
   createToolCallSplitter,
   executeSncsChat,
+  MAX_USER_MESSAGE_FRAME_BYTES,
   modelsFromSettings,
   openaiToSncsRequest,
   resolveModelAndEffort,
@@ -363,6 +364,41 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
   assert.equal(fencedCalls.length, 1)
   assert.equal(fencedCalls[0].function.name, "write_file")
   assert.equal(fencedCalls[0].function.arguments, '{"path":"a.txt"}')
+
+  // Large prompt with 30 verbose tool schemas + big system prompt + long older turns stays under 64 KB SNCS wire limit
+  const verboseTools = Array.from({ length: 30 }, (_, i) => ({
+    type: "function",
+    function: {
+      name: `tool_${i}`,
+      description: `Detailed description ${"x".repeat(400)} for tool ${i}`,
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Full path ".repeat(30) },
+          mode: { type: "string", enum: ["read", "write"] },
+          tags: { type: "array", items: { type: "string" } },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  }))
+  const hugeReq = openaiToSncsRequest({
+    model: "balanced",
+    tools: verboseTools,
+    messages: [
+      { role: "system", content: "CORE_SYSTEM\n" + "Guide rule line.\n".repeat(2500) },
+      { role: "user", content: "Step 1: inspect files" },
+      { role: "assistant", content: null, tool_calls: [{ id: "old1", type: "function", function: { name: "tool_0", arguments: '{"path":"a"}' } }] },
+      { role: "tool", tool_call_id: "old1", content: "FILE_LINE\n".repeat(2000) },
+      { role: "user", content: "Final task: edit_file douban_spider.py now" },
+    ],
+  })
+  const frameBytes = buildAidpInputFrame({ type: "user_message", payload: hugeReq.userMessagePayload }).byteLength
+  assert.ok(frameBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `Expected frameBytes ${frameBytes} <= ${MAX_USER_MESSAGE_FRAME_BYTES}`)
+  assert.ok(hugeReq.userMessagePayload.text.includes("Final task: edit_file douban_spider.py now"))
+  assert.ok(hugeReq.userMessagePayload.text.includes("tool_29(path*: string"))
+  assert.ok(hugeReq.userMessagePayload.text.endsWith("</client_tool_directive>"))
 })
 
 function makeMockWebSocketClass(responder) {
