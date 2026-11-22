@@ -11,6 +11,8 @@ export const REFRESH_LEAD_MS = 5 * 60 * 1000
 export const KEEP_RENEWED_MS = 60 * 1000
 export const SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000
 export const DESKTOP_CACHE_MS = 2000
+export const DESKTOP_NEGATIVE_CACHE_MS = 45_000
+export const MACOS_KEYCHAIN_TIMEOUT_MS = 45_000
 
 const GATEWAY_PROVIDERS = new Set(["gateway", "social_gateway"])
 const AIDP_PROVIDERS = new Set(["enterprise", "social"])
@@ -170,31 +172,67 @@ export function readWindowsCredentialRaw(targetName, execSync = execFileSync) {
   }
 }
 
-export function readPosixCredentialRaw(targetName, platform = process.platform, execSync = execFileSync) {
+function classifyDarwinKeychainError(err) {
+  if (err?.code === "ETIMEDOUT" || err?.killed) {
+    return {
+      kind: "timeout",
+      message:
+        "macOS Keychain authorization timed out while reading Amazon Quick desktop credentials. Enter your macOS login password and click 'Always Allow' in the Keychain dialog, or switch to 'Amazon Quick account (browser)' sign-in to avoid Keychain prompts.",
+    }
+  }
+  const stderr = String(err?.stderr ?? err?.message ?? "").trim()
+  if (/user canceled|interaction is not allowed|denied|authfailed|not allowed|-128|-25293|-25308/i.test(stderr)) {
+    return {
+      kind: "denied",
+      message:
+        "macOS Keychain denied access to Amazon Quick desktop credentials. Allow access ('Always Allow') with your macOS login password, or switch to 'Amazon Quick account (browser)' sign-in to avoid Keychain prompts.",
+    }
+  }
+  if (/could not be found|-25300/i.test(stderr)) {
+    return { kind: "not_found", message: "" }
+  }
+  return {
+    kind: "error",
+    message: stderr
+      ? `macOS Keychain failed to read Amazon Quick desktop credentials (${stderr.slice(0, 140)}). Try 'Amazon Quick account (browser)' sign-in instead.`
+      : "",
+  }
+}
+
+function readPosixCredentialDetailed(targetName, platform = process.platform, execSync = execFileSync, opts = {}) {
+  let lastError = null
   if (platform === "darwin") {
-    return readChunkedCredential((name) => {
+    const timeout = Number(opts.keychainTimeoutMs) > 0 ? Number(opts.keychainTimeoutMs) : MACOS_KEYCHAIN_TIMEOUT_MS
+    const value = readChunkedCredential((name) => {
       try {
         return execSync("security", ["find-generic-password", "-s", name, "-w"], {
           encoding: "utf8",
-          timeout: 5000,
-          stdio: ["ignore", "pipe", "ignore"],
+          timeout,
+          stdio: ["ignore", "pipe", "pipe"],
         }).replace(/\r?\n$/, "")
-      } catch {
+      } catch (err) {
+        lastError = classifyDarwinKeychainError(err)
         return null
       }
     }, targetName)
+    return { value, error: value ? null : lastError }
   }
-  return readChunkedCredential((name) => {
+  const value = readChunkedCredential((name) => {
     try {
       return execSync("secret-tool", ["lookup", "service", name], {
         encoding: "utf8",
         timeout: 5000,
-        stdio: ["ignore", "pipe", "ignore"],
+        stdio: ["ignore", "pipe", "pipe"],
       }).replace(/\r?\n$/, "")
     } catch {
       return null
     }
   }, targetName)
+  return { value, error: null }
+}
+
+export function readPosixCredentialRaw(targetName, platform = process.platform, execSync = execFileSync, opts = {}) {
+  return readPosixCredentialDetailed(targetName, platform, execSync, opts).value
 }
 
 export function readDesktopProfiles(opts = {}) {
@@ -267,10 +305,10 @@ export function normalizeAuth(cred, profile = null, source = "") {
   }
 }
 
-let desktopCache = { at: 0, key: "", mtimeMs: -1, value: null }
+let desktopCache = { at: 0, key: "", mtimeMs: -1, value: null, errorKind: "", errorMsg: "" }
 
 export function clearDesktopCache() {
-  desktopCache = { at: 0, key: "", mtimeMs: -1, value: null }
+  desktopCache = { at: 0, key: "", mtimeMs: -1, value: null, errorKind: "", errorMsg: "" }
 }
 
 function fileMtimeMs(path, statImpl = statSync) {
@@ -291,17 +329,25 @@ export function readDesktop(opts = {}) {
   const profilesFile = join(dir, "profiles.json")
   const mtimeMs = opts.readFileSync ? -1 : fileMtimeMs(profilesFile, opts.statSync)
   const key = `${opts.profileId || ""}|${dir}|${opts.readKeyring ? "mock" : "os"}`
-  if (!opts.noCache && desktopCache.value && desktopCache.key === key) {
-    const withinShortTtl = now - desktopCache.at < DESKTOP_CACHE_MS
-    const osTokenStillFresh =
-      !opts.readKeyring &&
-      !opts.readFileSync &&
-      mtimeMs > 0 &&
-      mtimeMs === desktopCache.mtimeMs &&
-      desktopCache.value.expires > 0 &&
-      desktopCache.value.expires - REFRESH_LEAD_MS > now
-    if (withinShortTtl || osTokenStillFresh) {
-      return desktopCache.value
+  const negativeTtl = Number(opts.negativeCacheMs) >= 0 ? Number(opts.negativeCacheMs) : DESKTOP_NEGATIVE_CACHE_MS
+  if (!opts.noCache && desktopCache.key === key) {
+    if (desktopCache.value) {
+      const withinShortTtl = now - desktopCache.at < DESKTOP_CACHE_MS
+      const osTokenStillFresh =
+        !opts.readKeyring &&
+        !opts.readFileSync &&
+        mtimeMs > 0 &&
+        mtimeMs === desktopCache.mtimeMs &&
+        desktopCache.value.expires > 0 &&
+        desktopCache.value.expires - REFRESH_LEAD_MS > now
+      if (withinShortTtl || osTokenStillFresh) {
+        return desktopCache.value
+      }
+    } else if (
+      (desktopCache.errorKind === "timeout" || desktopCache.errorKind === "denied") &&
+      now - desktopCache.at < negativeTtl
+    ) {
+      return null
     }
   }
   const profiles = readDesktopProfiles(opts)
@@ -309,12 +355,30 @@ export function readDesktop(opts = {}) {
   if (!profile) return null
   const target = `quickwork-${profile.provider}-${profile.id}`
   const platform = opts.platform ?? process.platform
-  const raw = opts.readKeyring
-    ? opts.readKeyring(target)
-    : platform === "win32"
-      ? readWindowsCredentialRaw(target, opts.execFileSync)
-      : readPosixCredentialRaw(target, platform, opts.execFileSync)
-  if (!raw) return null
+  let raw = null
+  let keyringErr = null
+  if (opts.readKeyring) {
+    raw = opts.readKeyring(target)
+  } else if (platform === "win32") {
+    raw = readWindowsCredentialRaw(target, opts.execFileSync)
+  } else {
+    const res = readPosixCredentialDetailed(target, platform, opts.execFileSync, opts)
+    raw = res.value
+    keyringErr = res.error
+  }
+  if (!raw) {
+    if (keyringErr && (keyringErr.kind === "timeout" || keyringErr.kind === "denied" || keyringErr.kind === "error")) {
+      desktopCache = {
+        at: now,
+        key,
+        mtimeMs,
+        value: null,
+        errorKind: keyringErr.kind,
+        errorMsg: keyringErr.message,
+      }
+    }
+    return null
+  }
   let parsed
   try {
     parsed = JSON.parse(raw)
@@ -323,20 +387,28 @@ export function readDesktop(opts = {}) {
   }
   const auth = normalizeAuth(parsed, profile, "desktop")
   if (!auth.access || !auth.tenantUrl) return null
-  if (!opts.noCache) desktopCache = { at: now, key, mtimeMs, value: auth }
+  if (!opts.noCache) desktopCache = { at: now, key, mtimeMs, value: auth, errorKind: "", errorMsg: "" }
   return auth
 }
 
 export function notDesktop(opts = {}) {
+  const dir = opts.dir ?? quickworkDir(opts.env, opts.home)
+  const key = `${opts.profileId || ""}|${dir}|${opts.readKeyring ? "mock" : "os"}`
+  if (desktopCache.key === key && !desktopCache.value && desktopCache.errorMsg) {
+    return desktopCache.errorMsg
+  }
   const profiles = readDesktopProfiles(opts)
   if (!profiles.entries.length) return "Amazon Quick desktop isn't signed in (no profiles found in ~/.quickwork/profiles.json)"
   return "Amazon Quick desktop credential isn't available or is signed out; sign in to Amazon Quick desktop again or use browser/file import"
 }
 
 export function desktopSignIn(opts = {}) {
+  const isMac = (opts.platform ?? process.platform) === "darwin"
   return {
     url: "",
-    instructions: "Uses the account Amazon Quick desktop is signed in to.",
+    instructions: isMac
+      ? "Uses Amazon Quick desktop's signed-in session (macOS may prompt for your login Keychain password when Quick refreshes its session; browser sign-in avoids Keychain prompts)."
+      : "Uses the account Amazon Quick desktop is signed in to.",
     method: "auto",
     async callback() {
       const d = readDesktop({ ...opts, noCache: true })

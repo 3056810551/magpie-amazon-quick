@@ -159,13 +159,16 @@ export function createAmazonQuickPlugin(deps = {}) {
         methods: [
           {
             type: "oauth",
-            label: `${PROVIDER_NAME} desktop's sign-in`,
-            authorize: async () => runDesktopSignIn(deps),
+            label: `${PROVIDER_NAME} account (browser)`,
+            authorize: () => runBrowserSignIn({}, deps),
           },
           {
             type: "oauth",
-            label: `${PROVIDER_NAME} account (browser)`,
-            authorize: () => runBrowserSignIn({}, deps),
+            label:
+              (deps.platform ?? process.platform) === "darwin"
+                ? `${PROVIDER_NAME} desktop's sign-in (macOS: requires Keychain password)`
+                : `${PROVIDER_NAME} desktop's sign-in`,
+            authorize: async () => runDesktopSignIn(deps),
           },
           {
             type: "oauth",

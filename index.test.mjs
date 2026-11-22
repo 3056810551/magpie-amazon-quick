@@ -17,10 +17,13 @@ import {
 } from "./codec.mjs"
 import {
   browserSignIn,
+  clearDesktopCache,
   desktopSignIn,
   fetchQuickSettings,
   importSignIns,
   invokeQbsApi,
+  MACOS_KEYCHAIN_TIMEOUT_MS,
+  notDesktop,
   readChunkedCredential,
   readDesktop,
   renewOidc,
@@ -1215,4 +1218,71 @@ test("idleTimeoutMs, overflowUserText upload, fetchQuickSettings cache, and brow
   const abRes = await flow.callback()
   assert.equal(abRes.type, "failed")
   assert.match(abRes.error, /timed out/i)
+})
+
+test("macOS Keychain timeout/denied negative cache, actionable errors, and browser-first sign-in methods", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "aq-mac-"))
+  try {
+    writeFileSync(
+      join(dir, "profiles.json"),
+      JSON.stringify({
+        version: 1,
+        last_active: "social-mac",
+        entries: [
+          {
+            id: "social-mac",
+            provider: "social",
+            display_name: "Mac User",
+            login_metadata: {
+              tenant_url: "https://qbs-mac.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+              client_id: "cid-mac",
+            },
+          },
+        ],
+      }),
+    )
+
+    // 1. Timeout records negative cache so subsequent calls within 45s do NOT re-spawn `security`
+    clearDesktopCache()
+    let calls = 0
+    let seenOpts = null
+    const timeoutExec = (_cmd, _args, opts) => {
+      calls++
+      seenOpts = opts
+      const err = new Error("spawnSync security ETIMEDOUT")
+      err.code = "ETIMEDOUT"
+      throw err
+    }
+    const t0 = 5_000_000
+    assert.equal(readDesktop({ dir, platform: "darwin", execFileSync: timeoutExec, now: t0 }), null)
+    assert.equal(calls, 1)
+    assert.equal(seenOpts.timeout, MACOS_KEYCHAIN_TIMEOUT_MS)
+    assert.deepEqual(seenOpts.stdio, ["ignore", "pipe", "pipe"])
+    assert.match(notDesktop({ dir, platform: "darwin" }), /macOS Keychain authorization timed out/i)
+    assert.match(notDesktop({ dir, platform: "darwin" }), /Always Allow/i)
+
+    // Within 45s negative cache window -> returns null without invoking `security` again
+    assert.equal(readDesktop({ dir, platform: "darwin", execFileSync: timeoutExec, now: t0 + 10_000 }), null)
+    assert.equal(calls, 1)
+
+    // After 45s window -> retries and classifies user denial cleanly
+    const deniedExec = () => {
+      calls++
+      const err = new Error("Command failed")
+      err.stderr = "security: SecKeychainSearchCopyNext: User interaction is not allowed."
+      throw err
+    }
+    assert.equal(readDesktop({ dir, platform: "darwin", execFileSync: deniedExec, now: t0 + 50_000 }), null)
+    assert.equal(calls, 2)
+    assert.match(notDesktop({ dir, platform: "darwin" }), /macOS Keychain denied access/i)
+    assert.match(notDesktop({ dir, platform: "darwin" }), /browser/i)
+
+    // 2. Auth methods list puts browser OIDC first and labels macOS Keychain caveat on desktop sign-in
+    const macPlugin = await createAmazonQuickPlugin({ platform: "darwin" })({})
+    assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick account (browser)")
+    assert.match(macPlugin.auth.methods[1].label, /macOS: requires Keychain password/i)
+  } finally {
+    clearDesktopCache()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
