@@ -188,6 +188,7 @@ export function modelsFromSettings(providerID, settings, baseURL = DEFAULT_API_U
 export function resolveModelAndEffort(requestedModel, body = {}) {
   let raw = String(requestedModel || "balanced").trim()
   if (raw.includes("/")) raw = raw.split("/").pop()
+  raw = raw.replace(/\[[^\]]+\]/g, "").trim()
   let atEffort = ""
   const atIdx = raw.lastIndexOf("@")
   if (atIdx > 0) {

@@ -310,6 +310,24 @@ test("model mapping, tool-call splitter, and openaiToSncsRequest handle variants
     autoRouting: false,
     thinkingEffort: "off",
   })
+  assert.deepEqual(resolveModelAndEffort("amazon-quick/smart[1m]"), {
+    modelId: "smart",
+    agentMode: "smart",
+    autoRouting: false,
+    thinkingEffort: "off",
+  })
+  assert.deepEqual(resolveModelAndEffort("amazon-quick/smart@high[1m]"), {
+    modelId: "smart",
+    agentMode: "smart",
+    autoRouting: false,
+    thinkingEffort: "high",
+  })
+  assert.deepEqual(resolveModelAndEffort("claude-sonnet-5-5[1m]@medium"), {
+    modelId: "balanced",
+    agentMode: "balanced",
+    autoRouting: false,
+    thinkingEffort: "medium",
+  })
 
   // OpenAI -> SNCS multi-turn + tools
   const sncs = openaiToSncsRequest({
