@@ -641,7 +641,7 @@ export async function browserSignIn(inputs = {}, opts = {}) {
     server.listen(0, "127.0.0.1", () => resolve())
   })
   server.unref?.()
-  const abandonMs = (opts.timeoutMs ?? SIGN_IN_TIMEOUT_MS) + 30_000
+  const abandonMs = Number(opts.abandonMs) > 0 ? Number(opts.abandonMs) : (opts.timeoutMs ?? SIGN_IN_TIMEOUT_MS) + 30_000
   const abandonTimer = setTimeout(() => {
     try { server.close() } catch {}
     rejectCode(new Error("Timed out waiting for Amazon Quick browser sign-in"))
@@ -858,7 +858,7 @@ const SETTINGS_CACHE_MS = 2 * 60 * 1000
 
 export async function fetchQuickSettings(a, opts = {}) {
   const key = `${a?.tenantUrl || ""}|${a?.awsAccountId || ""}|${a?.accountId || ""}`
-  const canCache = !opts.fetch && !opts.noCache
+  const canCache = opts.noCache !== true && (!opts.fetch || opts.cache === true)
   const now = opts.now ?? Date.now()
   if (canCache) {
     const hit = settingsCache.get(key)
@@ -884,7 +884,7 @@ export async function fetchQuickSettings(a, opts = {}) {
 export async function uploadQuickAttachment(a, file, opts = {}) {
   const fetchImpl = opts.fetch ?? fetch
   const name = str(file?.name) || "attachment.bin"
-  const mimeType = str(file?.mimeType) || "application/octet-stream"
+  const mimeType = str(file?.mimeType).split(";")[0].trim().toLowerCase() || "application/octet-stream"
   const raw = file?.bytes instanceof Uint8Array ? file.bytes : new Uint8Array(file?.bytes || 0)
   if (!raw.byteLength) throw new Error("Cannot upload empty attachment")
   const contentSha256 = createHash("sha256").update(raw).digest("hex")

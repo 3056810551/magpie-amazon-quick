@@ -18,6 +18,7 @@ import {
 import {
   browserSignIn,
   desktopSignIn,
+  fetchQuickSettings,
   importSignIns,
   invokeQbsApi,
   readChunkedCredential,
@@ -1015,4 +1016,94 @@ test("readDesktop mtime cache avoids repeated OS keyring calls and Gateway uploa
   assert.ok(gwCalls.some((c) => c.method === "PUT" && c.url.includes("/uploads/accounts/123456789012/attachments/presigned-url")))
   assert.ok(gwCalls.some((c) => c.method === "POST" && c.url.includes("/dlp/internal/123456789012/data-loss-prevention/job/describe-user-aware")))
   assert.ok(gwCalls.some((c) => c.method === "POST" && c.url.includes("/invocations/rpc")))
+})
+
+test("idleTimeoutMs, overflowUserText upload, fetchQuickSettings cache, and browserSignIn abandon cleanup work", async () => {
+  const acct = { providerType: "social", access: "tok-extra", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "extra-acct" }
+
+  // 1. WebSocket idle timeout rejects cleanly with 504 after handshake
+  const StalledWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "message_start", payload: {} })
+      // Never sends message_complete
+    })
+  })
+  await assert.rejects(
+    executeSncsChat(acct, { model: "fast", stream: false, messages: [{ role: "user", content: "Hi" }] }, { WebSocket: StalledWS, idleTimeoutMs: 40, stateful: false }),
+    (e) => e.status === 504 && /timed out/i.test(e.message),
+  )
+
+  // 2. Oversized user prompt triggers prompt_context.txt upload with MIME "text/plain" (no charset suffix)
+  const sentUserPayloads = []
+  let uploadedMime = ""
+  let uploadedName = ""
+  const mockUpload = async (_acct, file) => {
+    uploadedName = file.name
+    uploadedMime = file.mimeType
+    return {
+      type: "file",
+      name: file.name,
+      size: file.bytes.byteLength,
+      mimeType: file.mimeType,
+      path: `/workspace/attached_files/${file.name}`,
+      attachmentId: "att-big-1",
+      contentSha256: "abc123",
+    }
+  }
+  const OverflowWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sentUserPayloads.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "Read overflow file" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const hugePrompt = "Intro " + "X".repeat(65_000) + " End"
+  const overRes = await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: hugePrompt }] },
+    { WebSocket: OverflowWS, uploadAttachment: mockUpload, stateful: false },
+  )
+  assert.equal((await overRes.json()).choices[0].message.content, "Read overflow file")
+  assert.equal(uploadedName, "prompt_context.txt")
+  assert.equal(uploadedMime, "text/plain")
+  assert.equal(sentUserPayloads[0].attachments.length, 1)
+  assert.equal(sentUserPayloads[0].attachments[0].attachmentId, "att-big-1")
+
+  // 3. fetchQuickSettings reuses 2-min cache when cache is enabled
+  let settingsHits = 0
+  const sFetch = async () => {
+    settingsHits++
+    return new Response(JSON.stringify({ eventResponse: { invokeAgentResponse: JSON.stringify({ statusCode: 200, body: JSON.stringify({ frames: [{ type: "settings", payload: { db_limit: 5 } }] }) }) } }), { status: 200 })
+  }
+  const s1 = await fetchQuickSettings(acct, { fetch: sFetch, cache: true, now: 1_000_000 })
+  const s2 = await fetchQuickSettings(acct, { fetch: sFetch, cache: true, now: 1_060_000 })
+  assert.equal(s1.db_limit, 5)
+  assert.equal(s2.db_limit, 5)
+  assert.equal(settingsHits, 1)
+
+  // 4. browserSignIn abandon timer closes local callback server cleanly
+  const signInFetch = async (url) => {
+    if (String(url).endsWith("/client/register")) {
+      return new Response(JSON.stringify({ clientId: "cid-abandon", clientSecret: "sec" }), { status: 200 })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  const flow = await browserSignIn(
+    { tenantUrl: "https://qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev" },
+    { fetch: signInFetch, abandonMs: 30, dir: join(tmpdir(), "aq-nonexistent-" + Date.now()) },
+  )
+  assert.match(flow.url, /^https:\/\/oidc\.us-east-1\.amazonaws\.com\/authorize\?/)
+  const abRes = await flow.callback()
+  assert.equal(abRes.type, "failed")
+  assert.match(abRes.error, /timed out/i)
 })

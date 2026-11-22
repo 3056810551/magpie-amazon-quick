@@ -1068,7 +1068,7 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
         const bytes = Buffer.from(reqPlan.overflowUserText, "utf8")
         const uploaded = await uploader(
           a,
-          { name: "prompt_context.txt", mimeType: "text/plain; charset=utf-8", bytes, threadId: reqPlan.threadId },
+          { name: "prompt_context.txt", mimeType: "text/plain", bytes, threadId: reqPlan.threadId },
           opts,
         )
         return serializeWireAttachment(uploaded)
