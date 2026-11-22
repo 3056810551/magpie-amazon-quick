@@ -19,6 +19,7 @@ import {
   browserSignIn,
   clearDesktopCache,
   desktopSignIn,
+  deviceCodeSignIn,
   fetchQuickSettings,
   importSignIns,
   invokeQbsApi,
@@ -701,8 +702,10 @@ test("AmazonQuickAuthPlugin executes SSE streaming, 401 token retry, usage, and 
     },
     aisdk: { hook: async () => {} },
   })
-  assert.equal(addedMethods.length, 3)
+  assert.equal(addedMethods.length, 4)
   assert.equal(addedMethods[0].integrationID, "amazon-quick")
+  assert.match(addedMethods[2].method.label, /Device Code/i)
+  assert.equal(addedMethods[2].method.form?.every((f) => !f.required), true)
   assert.equal(addedProviders[0].info.id, "amazon-quick")
 
   const pkgJson = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
@@ -1299,8 +1302,126 @@ test("macOS Keychain timeout/denied negative cache, actionable errors, and brows
     const macPlugin = await createAmazonQuickPlugin({ platform: "darwin" })({})
     assert.equal(macPlugin.auth.methods[0].label, "Amazon Quick account (browser)")
     assert.match(macPlugin.auth.methods[1].label, /macOS: requires Keychain password/i)
+    assert.match(macPlugin.auth.methods[2].label, /Device Code/i)
   } finally {
     clearDesktopCache()
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("deviceCodeSignIn supports headless/VPS OAuth device polling, slow_down, abort, and bare hostnames", async () => {
+  const missingDir = join(tmpdir(), "aq-missing-dc-" + Date.now())
+
+  // 1. Missing tenantUrl without local desktop profiles.json fails with actionable VPS hint
+  await assert.rejects(
+    deviceCodeSignIn({}, { dir: missingDir }),
+    (e) => /Missing Amazon Quick Tenant URL/i.test(e.message) && /profiles\.json/i.test(e.message),
+  )
+
+  // 2. Happy path: bare hostnames normalized, polls authorization_pending -> slow_down -> success
+  const seenCalls = []
+  let pollAttempt = 0
+  const mockFetch = async (url, init) => {
+    const body = JSON.parse(init.body)
+    seenCalls.push({ url: String(url), body })
+    if (String(url).endsWith("/client/register")) {
+      assert.deepEqual(body.grantTypes, ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"])
+      assert.equal(body.issuerUrl, "https://identitycenter.amazonaws.com/ssoins-7223b3b7b80ce833")
+      return new Response(JSON.stringify({ clientId: "cid-dev-1", clientSecret: "sec-dev-1" }), { status: 200 })
+    }
+    if (String(url).endsWith("/device_authorization")) {
+      assert.equal(body.clientId, "cid-dev-1")
+      assert.equal(body.clientSecret, "sec-dev-1")
+      assert.equal(body.startUrl, "https://identitycenter.amazonaws.com/ssoins-7223b3b7b80ce833")
+      return new Response(
+        JSON.stringify({
+          deviceCode: "dev-code-123",
+          userCode: "ABCD-EFGH",
+          verificationUri: "https://us-east-1.signin.aws/platform/authorize",
+          verificationUriComplete: "https://us-east-1.signin.aws/platform/authorize?user_code=ABCD-EFGH",
+          expiresIn: 600,
+          interval: 1,
+        }),
+        { status: 200 },
+      )
+    }
+    if (String(url).endsWith("/token")) {
+      pollAttempt++
+      assert.equal(body.grantType, "urn:ietf:params:oauth:grant-type:device_code")
+      assert.equal(body.deviceCode, "dev-code-123")
+      if (pollAttempt === 1) {
+        return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 400 })
+      }
+      if (pollAttempt === 2) {
+        return new Response(JSON.stringify({ error: "slow_down" }), { status: 400 })
+      }
+      return new Response(
+        JSON.stringify({ accessToken: "acc-dev-ok", refreshToken: "ref-dev-ok", expiresIn: 3600 }),
+        { status: 200 },
+      )
+    }
+    return new Response("{}", { status: 404 })
+  }
+
+  const flow = await deviceCodeSignIn(
+    {
+      tenantUrl: "qbs-cell9d81.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev/",
+      issuerUrl: "identitycenter.amazonaws.com/ssoins-7223b3b7b80ce833/",
+    },
+    { fetch: mockFetch, dir: missingDir, pollIntervalMs: 5, slowDownStepMs: 5 },
+  )
+  assert.equal(flow.method, "auto")
+  assert.equal(flow.url, "https://us-east-1.signin.aws/platform/authorize?user_code=ABCD-EFGH")
+  assert.match(flow.instructions, /ABCD-EFGH/)
+
+  const res = await flow.callback()
+  assert.equal(res.type, "success")
+  assert.equal(res.access, "acc-dev-ok")
+  assert.equal(res.refresh, "ref-dev-ok")
+  assert.equal(res.clientId, "cid-dev-1")
+  assert.equal(res.clientSecret, "sec-dev-1")
+  assert.equal(res.tenantUrl, "https://qbs-cell9d81.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev")
+  assert.equal(res.issuerUrl, "https://identitycenter.amazonaws.com/ssoins-7223b3b7b80ce833")
+  assert.equal(res.providerType, "social")
+  assert.equal(pollAttempt, 3)
+
+  // 3. Cancellation via AbortSignal stops polling immediately
+  const ac = new AbortController()
+  const abortFlow = await deviceCodeSignIn(
+    { tenantUrl: "https://tenant.desktop.enterprise.quick.aws.com" },
+    {
+      fetch: async (url) => {
+        if (String(url).endsWith("/client/register")) return new Response(JSON.stringify({ clientId: "cid-ab" }), { status: 200 })
+        if (String(url).endsWith("/device_authorization")) {
+          return new Response(JSON.stringify({ deviceCode: "dc-ab", verificationUriComplete: "https://example.aws/verify", expiresIn: 600, interval: 5 }), { status: 200 })
+        }
+        return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 400 })
+      },
+      dir: missingDir,
+      pollIntervalMs: 5000,
+    },
+  )
+  setTimeout(() => ac.abort(), 15)
+  const abRes = await abortFlow.callback(undefined, { signal: ac.signal })
+  assert.equal(abRes.type, "failed")
+  assert.match(abRes.error, /cancelled/i)
+
+  // 4. access_denied returns clean failure
+  const deniedFlow = await deviceCodeSignIn(
+    { tenantUrl: "https://qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev" },
+    {
+      fetch: async (url) => {
+        if (String(url).endsWith("/client/register")) return new Response(JSON.stringify({ clientId: "cid-den" }), { status: 200 })
+        if (String(url).endsWith("/device_authorization")) {
+          return new Response(JSON.stringify({ deviceCode: "dc-den", verificationUri: "https://example.aws/verify", expiresIn: 600, interval: 1 }), { status: 200 })
+        }
+        return new Response(JSON.stringify({ error: "access_denied" }), { status: 400 })
+      },
+      dir: missingDir,
+      pollIntervalMs: 5,
+    },
+  )
+  const denRes = await deniedFlow.callback()
+  assert.equal(denRes.type, "failed")
+  assert.match(denRes.error, /denied/i)
 })

@@ -647,24 +647,62 @@ export async function importSignIns(texts, opts = {}) {
   return results
 }
 
-// ---- Browser OAuth PKCE (AWS IAM Identity Center sso-oidc) ----
+// ---- Browser OAuth PKCE & Device Code (AWS IAM Identity Center sso-oidc) ----
 
 function base64Url(buf) {
   return Buffer.from(buf).toString("base64url")
 }
 
-export async function browserSignIn(inputs = {}, opts = {}) {
+function normalizeHttpsUrl(value) {
+  const s = str(value).replace(/\/+$/, "")
+  if (!s) return ""
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`
+}
+
+function resolveOidcContext(inputs = {}, opts = {}) {
   const desktopHint = readDesktopProfiles(opts)
   const hintedProfile = selectDesktopProfile(desktopHint)
-  const issuerUrl = str(inputs?.issuerUrl || hintedProfile?.login_metadata?.issuer_url || DEFAULT_SOCIAL_ISSUER_URL).replace(/\/+$/, "")
-  const tenantUrl = str(inputs?.tenantUrl || hintedProfile?.login_metadata?.tenant_url).replace(/\/+$/, "")
-  const providerType = str(inputs?.providerType) || (isSocialProvider(hintedProfile?.provider) || issuerUrl === DEFAULT_SOCIAL_ISSUER_URL ? "social" : "enterprise")
+  const issuerUrl = normalizeHttpsUrl(inputs?.issuerUrl || hintedProfile?.login_metadata?.issuer_url || DEFAULT_SOCIAL_ISSUER_URL)
+  const tenantUrl = normalizeHttpsUrl(inputs?.tenantUrl || hintedProfile?.login_metadata?.tenant_url)
+  const tenantHost = hostFromUrl(tenantUrl)
+  const looksGateway = /\.(?:desktop\.)?(?:enterprise\.)?quick\.aws\.(?:com|dev)$/i.test(tenantHost)
+  const providerType =
+    str(inputs?.providerType) ||
+    (looksGateway
+      ? "gateway"
+      : isSocialProvider(hintedProfile?.provider) || issuerUrl === DEFAULT_SOCIAL_ISSUER_URL || /\/ssoins-/i.test(issuerUrl)
+        ? "social"
+        : "enterprise")
+  const region = str(inputs?.region) || regionFromUrl(issuerUrl) || regionFromUrl(tenantUrl) || "us-east-1"
+  return { issuerUrl, tenantUrl, providerType, region }
+}
+
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(t)
+      resolve()
+    }
+    const t = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort)
+      resolve()
+    }, ms)
+    t.unref?.()
+    signal?.addEventListener?.("abort", onAbort, { once: true })
+  })
+}
+
+export async function browserSignIn(inputs = {}, opts = {}) {
+  const { issuerUrl, tenantUrl, providerType, region } = resolveOidcContext(inputs, opts)
   if (!tenantUrl) {
     throw new Error(
-      "Missing Amazon Quick Tenant URL (qbs-...plato.ai.aws.dev): sign in on Amazon Quick desktop once on this machine or use the Enterprise / Custom OIDC method to enter Tenant URL.",
+      'Missing Amazon Quick Tenant URL (qbs-...plato.ai.aws.dev): sign in on Amazon Quick desktop once on this machine, or for VPS / remote / headless setups use "Amazon Quick Device Code (VPS / Remote / Headless)" or "Import accounts from a file…".',
     )
   }
-  const region = str(inputs?.region) || regionFromUrl(issuerUrl) || regionFromUrl(tenantUrl) || "us-east-1"
   const fetchImpl = opts.fetch ?? fetch
   const oidcBase = `https://oidc.${region}.amazonaws.com`
 
@@ -810,6 +848,141 @@ export async function browserSignIn(inputs = {}, opts = {}) {
         clearTimeout(abandonTimer)
         server.close()
       }
+    },
+  }
+}
+
+/**
+ * OAuth 2.0 Device Authorization Grant flow (`urn:ietf:params:oauth:grant-type:device_code`)
+ * for VPS, Docker, SSH, and remote web-UI deployments where localhost callbacks cannot reach the server.
+ */
+export async function deviceCodeSignIn(inputs = {}, opts = {}) {
+  const { issuerUrl, tenantUrl, providerType, region } = resolveOidcContext(inputs, opts)
+  if (!tenantUrl) {
+    throw new Error(
+      "Missing Amazon Quick Tenant URL (https://qbs-...plato.ai.aws.dev). Copy tenant_url and issuer_url from ~/.quickwork/profiles.json on a machine where Amazon Quick desktop has signed in, or use Import accounts from a file.",
+    )
+  }
+  const fetchImpl = opts.fetch ?? fetch
+  const oidcBase = `https://oidc.${region}.amazonaws.com`
+
+  const regRes = await fetchImpl(`${oidcBase}/client/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      clientName: "Amazon Quick",
+      clientType: "public",
+      scopes: ["quicksight:read_write"],
+      grantTypes: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+      issuerUrl,
+    }),
+  })
+  const regJson = await regRes.json().catch(() => ({}))
+  if (!regRes.ok || !regJson?.clientId) {
+    throw new Error(`OIDC client registration failed (${regRes.status}): ${regJson?.error_description || regJson?.message || regRes.statusText}`)
+  }
+
+  const devRes = await fetchImpl(`${oidcBase}/device_authorization`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      clientId: regJson.clientId,
+      ...(regJson.clientSecret ? { clientSecret: regJson.clientSecret } : {}),
+      startUrl: issuerUrl,
+    }),
+  })
+  const devJson = await devRes.json().catch(() => ({}))
+  const authUrl = str(devJson?.verificationUriComplete || devJson?.verificationUri)
+  if (!devRes.ok || !devJson?.deviceCode || !authUrl) {
+    throw new Error(`OIDC device authorization failed (${devRes.status}): ${devJson?.error_description || devJson?.message || devRes.statusText}`)
+  }
+
+  const userCode = str(devJson.userCode)
+  const defaultIntervalMs = Math.max(1000, (Number(devJson.interval) || 2) * 1000)
+  const expiresMs = (Number(devJson.expiresIn) > 0 ? Number(devJson.expiresIn) : 600) * 1000
+
+  return {
+    url: authUrl,
+    instructions: userCode
+      ? `Open the link on any device (local PC or phone) and confirm code ${userCode} to sign in — no localhost callback needed.`
+      : "Open the link on any device (local PC or phone) to complete AWS sign-in — no localhost callback needed.",
+    method: "auto",
+    async callback(_code, cbOpts = {}) {
+      const signal = cbOpts?.signal ?? opts.signal
+      const getNow = typeof opts.now === "function" ? opts.now : () => Date.now()
+      const maxWaitMs = Math.min(expiresMs, opts.timeoutMs ?? SIGN_IN_TIMEOUT_MS)
+      const deadline = getNow() + maxWaitMs
+      let intervalMs = Number(opts.pollIntervalMs) > 0 ? Number(opts.pollIntervalMs) : defaultIntervalMs
+      const slowDownStepMs = Number(opts.slowDownStepMs) > 0 ? Number(opts.slowDownStepMs) : 5000
+      let netFailures = 0
+
+      while (getNow() < deadline) {
+        if (signal?.aborted) return { type: "failed", error: "Amazon Quick device sign-in cancelled" }
+        const remaining = deadline - getNow()
+        if (remaining <= 0) break
+        await sleepAbortable(Math.min(intervalMs, remaining), signal)
+        if (signal?.aborted) return { type: "failed", error: "Amazon Quick device sign-in cancelled" }
+
+        let tokRes
+        try {
+          tokRes = await fetchImpl(`${oidcBase}/token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              clientId: regJson.clientId,
+              ...(regJson.clientSecret ? { clientSecret: regJson.clientSecret } : {}),
+              grantType: "urn:ietf:params:oauth:grant-type:device_code",
+              deviceCode: devJson.deviceCode,
+            }),
+            ...(signal ? { signal } : {}),
+          })
+          netFailures = 0
+        } catch (e) {
+          if (signal?.aborted) return { type: "failed", error: "Amazon Quick device sign-in cancelled" }
+          netFailures++
+          if (netFailures >= 3) {
+            return { type: "failed", error: `OIDC token poll failed: ${e?.message ?? String(e)}` }
+          }
+          continue
+        }
+
+        const tok = await tokRes.json().catch(() => ({}))
+        if (tokRes.ok && tok?.accessToken) {
+          const expiresIn = Number(tok.expiresIn) > 0 ? Number(tok.expiresIn) : 3600
+          return {
+            ...normalizeAuth({
+              access: tok.accessToken,
+              refresh: tok.refreshToken || "",
+              expires: getNow() + expiresIn * 1000,
+              clientId: regJson.clientId,
+              clientSecret: regJson.clientSecret || "",
+              issuerUrl,
+              tenantUrl,
+              region,
+              providerType,
+              accountId: hostFromUrl(tenantUrl) || "Amazon Quick",
+            }),
+            type: "success",
+          }
+        }
+
+        const errCode = str(tok?.error || tok?.__type || "")
+        if (/authorization_pending|AuthorizationPendingException/i.test(errCode)) continue
+        if (/slow_down|SlowDownException/i.test(errCode)) {
+          intervalMs = Math.min(intervalMs + slowDownStepMs, 15_000)
+          continue
+        }
+        if (/expired_token|ExpiredTokenException/i.test(errCode)) {
+          return { type: "failed", error: "Device authorization expired; please retry sign-in." }
+        }
+        if (/access_denied|AccessDeniedException/i.test(errCode)) {
+          return { type: "failed", error: "Amazon Quick sign-in was denied or cancelled." }
+        }
+        const msg = str(tok?.error_description || tok?.message) || tokRes.statusText || String(tokRes.status)
+        return { type: "failed", error: `OIDC token exchange failed (${errCode || tokRes.status}): ${msg}` }
+      }
+
+      return { type: "failed", error: "Timed out waiting for Amazon Quick device sign-in" }
     },
   }
 }

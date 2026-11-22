@@ -2,6 +2,7 @@ import {
   browserSignIn,
   currentAuth,
   desktopSignIn,
+  deviceCodeSignIn,
   fetchQuickSettings,
   IMPORT_FROM,
   importSignIns,
@@ -73,6 +74,7 @@ function refusedReason(a, why) {
 export function createAmazonQuickPlugin(deps = {}) {
   const runDesktopSignIn = deps.desktopSignIn ?? desktopSignIn
   const runBrowserSignIn = deps.browserSignIn ?? browserSignIn
+  const runDeviceCodeSignIn = deps.deviceCodeSignIn ?? deviceCodeSignIn
   const runImportSignIns = deps.importSignIns ?? importSignIns
   const getCurrentAuth = deps.currentAuth ?? currentAuth
   const getReissuedAuth = deps.reissuedAuth ?? reissuedAuth
@@ -172,6 +174,29 @@ export function createAmazonQuickPlugin(deps = {}) {
           },
           {
             type: "oauth",
+            label: `${PROVIDER_NAME} Device Code (VPS / Remote / Headless)`,
+            prompts: [
+              {
+                type: "text",
+                key: "tenantUrl",
+                message:
+                  "Amazon Quick Tenant URL (copy tenant_url from ~/.quickwork/profiles.json; leave blank if desktop is installed here)",
+                placeholder: "https://qbs-...dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+                required: false,
+              },
+              {
+                type: "text",
+                key: "issuerUrl",
+                message:
+                  "AWS IAM Identity Center Issuer URL (copy issuer_url from ~/.quickwork/profiles.json; leave blank for default)",
+                placeholder: "https://identitycenter.amazonaws.com/ssoins-...",
+                required: false,
+              },
+            ],
+            authorize: (inputs) => runDeviceCodeSignIn(inputs, deps),
+          },
+          {
+            type: "oauth",
             label: `${PROVIDER_NAME} Enterprise / Custom OIDC (browser)`,
             prompts: [
               {
@@ -179,6 +204,7 @@ export function createAmazonQuickPlugin(deps = {}) {
                 key: "issuerUrl",
                 message: "AWS IAM Identity Center Issuer URL (leave blank for default Social SSO)",
                 placeholder: "https://identitycenter.amazonaws.com/ssoins-...",
+                required: false,
               },
               {
                 type: "text",
