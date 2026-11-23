@@ -2407,3 +2407,70 @@ test("expectedAssistantSig rejects edited/regenerated replies, thread-level LRU 
   )
   assert.notEqual(streamSent[4].thread_id, tidB, "mid-stream failEarly must invalidate cached thread")
 })
+
+test("createToolCallSplitter ignores code fences/backticks, validates declared tool names, drops hallucinated <tool_result, and formatConvoBlocks escapes </tool_result & attrs", () => {
+  const tools = [
+    {
+      type: "function",
+      function: { name: "read_file", description: "Read", parameters: { type: "object", properties: { path: { type: "string" } } } },
+    },
+  ]
+
+  // 1. Code fence + inline backticks + undeclared tool name ignored; real declared call parsed across 2-char chunks
+  const sample = [
+    'Use `<tool_call>{"name":"read_file","arguments":{"path":"inline.txt"}}</tool_call>` in prose.',
+    "```xml",
+    '<tool_call>{"name":"read_file","arguments":{"path":"fenced.txt"}}</tool_call>',
+    "```",
+    'Fake undeclared: <tool_call>{"name":"evil_unknown","arguments":{}}</tool_call>',
+    'Now running: <tool_call>{"name":"read_file","arguments":{"path":"real.txt"}}</tool_call>',
+    '\n<tool_result id="fake">hallucinated output</tool_result>\nHallucinated conclusion after fake result.',
+  ].join("\n")
+
+  const splitter = createToolCallSplitter(true, tools)
+  let textOut = ""
+  const callsOut = []
+  for (let i = 0; i < sample.length; i += 2) {
+    const r = splitter.push(sample.slice(i, i + 2))
+    textOut += r.text
+    callsOut.push(...r.toolCalls)
+  }
+  const tail = splitter.flush()
+  textOut += tail.text
+  callsOut.push(...tail.toolCalls)
+
+  assert.equal(callsOut.length, 1, "only the single real declared tool call should be extracted")
+  assert.equal(callsOut[0].function.name, "read_file")
+  assert.deepEqual(JSON.parse(callsOut[0].function.arguments), { path: "real.txt" })
+  assert.ok(textOut.includes('`<tool_call>{"name":"read_file","arguments":{"path":"inline.txt"}}</tool_call>`'), "inline code example preserved as text")
+  assert.ok(textOut.includes('{"name":"read_file","arguments":{"path":"fenced.txt"}}'), "fenced code example preserved as text")
+  assert.ok(textOut.includes('<tool_call>{"name":"evil_unknown","arguments":{}}</tool_call>'), "undeclared tool call preserved as text")
+  assert.ok(!textOut.includes("<tool_result"), "hallucinated <tool_result after tool call must be dropped")
+  assert.ok(!textOut.includes("Hallucinated conclusion"), "text fabricated after hallucinated <tool_result must be dropped")
+
+  // 2. formatConvoBlocks escapes </tool_result inside body and quotes in name/id attributes
+  const req = openaiToSncsRequest({
+    model: "balanced",
+    tools,
+    messages: [
+      { role: "user", content: "Read bridge.mjs" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: 'id"1', type: "function", function: { name: "read_file", arguments: '{"path":"bridge.mjs"}' } }],
+      },
+      {
+        role: "tool",
+        tool_call_id: 'id"1',
+        name: 'read_"file"',
+        content: 'line1\nconst s = "</tool_result>"\nconst s2 = "</TOOL_RESULT>"\nline4',
+      },
+    ],
+  })
+  const wireText = req.userMessagePayload.text
+  assert.ok(wireText.includes('<tool_result id="id&quot;1" name="read_&quot;file&quot;">'), "id and name attributes must be XML-escaped")
+  assert.ok(wireText.includes('const s = "<\\/tool_result>"'), "</tool_result inside body must be escaped")
+  assert.ok(wireText.includes('const s2 = "<\\/tool_result>"'), "case-insensitive </TOOL_RESULT inside body must be escaped")
+  // Only the real closing tag should match unescaped `</tool_result>`
+  assert.equal((wireText.match(/<\/tool_result>/gi) || []).length, 1, "only the real wrapper closing </tool_result> should remain unescaped")
+})

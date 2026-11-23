@@ -720,6 +720,18 @@ function systemDeltaText(prevSys, nextSys, maxDiffChars = 20000) {
   return diffText.length <= maxDiffChars ? diffText : truncateMiddle(diffText, maxDiffChars)
 }
 
+function escapeXmlAttr(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+}
+
+function escapeToolResultBody(text) {
+  return String(text ?? "").replace(/<\/tool_result/gi, "<\\/tool_result")
+}
+
 function formatConvoBlocks(msgs) {
   if (msgs.length === 1 && String(msgs[0]?.role || "user").toLowerCase() === "user" && !msgs[0]?.tool_calls?.length) {
     return [{ text: textFromContent(msgs[0].content), msgIndex: 0, role: "user" }]
@@ -746,10 +758,11 @@ function formatConvoBlocks(msgs) {
       }
       blocks.push({ text: `Assistant:\n${content}`, msgIndex: idx, role: "assistant" })
     } else if (role === "tool") {
-      const callId = msg.tool_call_id || msg.name || "tool"
-      const nameAttr = msg.name ? ` name="${msg.name}"` : ""
+      const callId = escapeXmlAttr(msg.tool_call_id || msg.name || "tool")
+      const nameAttr = msg.name ? ` name="${escapeXmlAttr(msg.name)}"` : ""
+      const safeBody = escapeToolResultBody(textFromContent(msg.content))
       blocks.push({
-        text: `<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`,
+        text: `<tool_result id="${callId}"${nameAttr}>\n${safeBody}\n</tool_result>`,
         msgIndex: idx,
         role: "tool",
       })
@@ -1510,7 +1523,9 @@ function parseToolBlock(openTag, inner, paramTypeMap) {
 
 /**
  * Stateful splitter for `<tool_call>...</tool_call>` and `<function_calls><invoke>...</function_calls>`
- * blocks inside streamed text chunks.
+ * blocks inside streamed text chunks. Ignores tags inside Markdown fenced code blocks or inline backticks,
+ * validates tool names against declared tools when provided, and drops hallucinated `<tool_result` blocks
+ * emitted after a tool call.
  */
 export function createToolCallSplitter(enabled, tools = []) {
   const paramTypeMap = buildParamTypeMap(tools)
@@ -1519,6 +1534,32 @@ export function createToolCallSplitter(enabled, tools = []) {
   let toolIndex = 0
   const calls = []
 
+  // Markdown code-span / code-fence tracking outside active tool blocks
+  let inFence = false
+  let fenceLen = 0
+  let inlineTicks = 0
+  let atLineStart = true
+  let prevCharWasNewline = false
+
+  // Post-tool-call hallucinated `<tool_result` guard
+  let afterToolCall = false
+  let discardHallucinated = false
+
+  const HALLUCINATED_TAG = "<tool_result"
+
+  const advancePlainChar = (ch) => {
+    if (ch === "\n") {
+      if (prevCharWasNewline && inlineTicks > 0) inlineTicks = 0
+      prevCharWasNewline = true
+      atLineStart = true
+    } else if (ch === "\r") {
+      // keep newline state
+    } else {
+      prevCharWasNewline = false
+      if (ch !== " " && ch !== "\t") atLineStart = false
+    }
+  }
+
   const processChunk = (delta, flushAll = false) => {
     const textPieces = []
     const toolCalls = []
@@ -1526,37 +1567,18 @@ export function createToolCallSplitter(enabled, tools = []) {
       if (delta) textPieces.push(delta)
       return { text: textPieces.join(""), toolCalls }
     }
+    if (discardHallucinated) {
+      return { text: "", toolCalls }
+    }
     buf += delta
+
     while (buf.length > 0) {
-      if (!activePair) {
-        let bestIdx = -1
-        let bestPair = null
-        for (const pair of TAG_PAIRS) {
-          const idx = buf.indexOf(pair[0])
-          if (idx >= 0 && (bestIdx < 0 || idx < bestIdx)) {
-            bestIdx = idx
-            bestPair = pair
-          }
-        }
-        if (bestPair) {
-          if (bestIdx > 0) textPieces.push(buf.slice(0, bestIdx))
-          buf = buf.slice(bestIdx + bestPair[0].length)
-          activePair = bestPair
-          continue
-        }
-        if (flushAll) {
-          textPieces.push(buf)
-          buf = ""
-          break
-        }
-        const hold = maxOpenTagHold(buf)
-        const safeLen = buf.length - hold
-        if (safeLen > 0) {
-          textPieces.push(buf.slice(0, safeLen))
-          buf = buf.slice(safeLen)
-        }
+      if (discardHallucinated) {
+        buf = ""
         break
-      } else {
+      }
+
+      if (activePair) {
         const [openTag, closeTag] = activePair
         const idx = buf.indexOf(closeTag)
         if (idx >= 0) {
@@ -1565,18 +1587,30 @@ export function createToolCallSplitter(enabled, tools = []) {
           activePair = null
           const parsedList = parseToolBlock(openTag, inner, paramTypeMap)
           if (parsedList) {
-            for (const parsed of parsedList) {
-              const call = {
-                index: toolIndex++,
-                id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-                type: "function",
-                function: parsed,
+            const validCalls = paramTypeMap.size ? parsedList.filter((p) => paramTypeMap.has(p.name)) : parsedList
+            if (validCalls.length > 0) {
+              for (const parsed of validCalls) {
+                const call = {
+                  index: toolIndex++,
+                  id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+                  type: "function",
+                  function: parsed,
+                }
+                calls.push(call)
+                toolCalls.push(call)
               }
-              calls.push(call)
-              toolCalls.push(call)
+              afterToolCall = true
+              atLineStart = false
+              prevCharWasNewline = false
+            } else {
+              textPieces.push(openTag + inner + closeTag)
+              atLineStart = false
+              prevCharWasNewline = false
             }
           } else {
             textPieces.push(openTag + inner + closeTag)
+            atLineStart = false
+            prevCharWasNewline = false
           }
           continue
         }
@@ -1587,7 +1621,120 @@ export function createToolCallSplitter(enabled, tools = []) {
         }
         break
       }
+
+      // If we just emitted a tool call and are outside code blocks, check whether the model
+      // starts fabricating a `<tool_result...>` block right after optional whitespace.
+      if (afterToolCall && !inFence && inlineTicks === 0) {
+        let wsEnd = 0
+        while (wsEnd < buf.length && /\s/.test(buf[wsEnd])) wsEnd++
+        if (wsEnd === buf.length) {
+          if (flushAll) {
+            for (let k = 0; k < buf.length; k++) advancePlainChar(buf[k])
+            textPieces.push(buf)
+            buf = ""
+            afterToolCall = false
+          }
+          break
+        }
+        const rest = buf.slice(wsEnd)
+        const lowerRest = rest.toLowerCase()
+        if (lowerRest.startsWith(HALLUCINATED_TAG)) {
+          const nextCh = rest[HALLUCINATED_TAG.length]
+          if (nextCh === undefined && !flushAll) break
+          if (nextCh === undefined || /[\s>/]/.test(nextCh)) {
+            discardHallucinated = true
+            buf = ""
+            break
+          }
+        } else if (!flushAll && HALLUCINATED_TAG.startsWith(lowerRest)) {
+          // Partial `<tool_result` prefix right after tool call — hold until more arrives
+          break
+        }
+        // Check if another real tool call immediately follows whitespace; otherwise normal text resumes
+        const isNextToolOpen = TAG_PAIRS.some(([open]) => rest.startsWith(open))
+        const isPartialToolOpen = !flushAll && TAG_PAIRS.some(([open]) => open.startsWith(rest))
+        if (isPartialToolOpen && !isNextToolOpen) break
+        if (!isNextToolOpen) afterToolCall = false
+      }
+
+      // Scan outside activePair, tracking Markdown fences (```) and inline backticks (`)
+      let i = 0
+      let emittedEnd = 0
+      let needMore = false
+
+      while (i < buf.length) {
+        const ch = buf[i]
+
+        if (ch === "`") {
+          let end = i + 1
+          while (end < buf.length && buf[end] === "`") end++
+          if (end === buf.length && !flushAll) {
+            // Trailing backticks may continue in the next chunk
+            needMore = true
+            break
+          }
+          const count = end - i
+          if (inFence) {
+            if (atLineStart && count >= fenceLen) {
+              inFence = false
+              fenceLen = 0
+            }
+          } else if (inlineTicks > 0) {
+            if (count === inlineTicks) inlineTicks = 0
+          } else if (atLineStart && count >= 3) {
+            inFence = true
+            fenceLen = count
+          } else {
+            inlineTicks = count
+          }
+          prevCharWasNewline = false
+          atLineStart = false
+          i = end
+          emittedEnd = end
+          continue
+        }
+
+        if (!inFence && inlineTicks === 0 && ch === "<") {
+          let matchedPair = null
+          for (const pair of TAG_PAIRS) {
+            if (buf.startsWith(pair[0], i)) {
+              matchedPair = pair
+              break
+            }
+          }
+          if (matchedPair) {
+            if (i > 0) textPieces.push(buf.slice(0, i))
+            buf = buf.slice(i + matchedPair[0].length)
+            activePair = matchedPair
+            emittedEnd = -1
+            break
+          }
+          if (!flushAll) {
+            const tail = buf.slice(i)
+            const partial = TAG_PAIRS.some(([open]) => open.startsWith(tail))
+            if (partial) {
+              needMore = true
+              break
+            }
+          }
+        }
+
+        advancePlainChar(ch)
+        i++
+        emittedEnd = i
+      }
+
+      if (emittedEnd === -1) {
+        // Entered activePair — loop again to look for closeTag
+        continue
+      }
+      if (emittedEnd > 0) {
+        textPieces.push(buf.slice(0, emittedEnd))
+        buf = buf.slice(emittedEnd)
+      }
+      if (needMore || buf.length === 0) break
     }
+
     return { text: textPieces.join(""), toolCalls }
   }
 
