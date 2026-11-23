@@ -1714,7 +1714,8 @@ test("resumed thread sends incremental <tools_update> when toolset changes acros
   assert.equal(sentPayloads[2].thread_id, tid)
   assert.ok(!sentPayloads[2].text.includes("<tools_update>"), "unchanged toolset should not re-emit <tools_update>")
 
-  // Turn 4: all tools removed -> <tools_update> explicitly informs model tools are disabled
+  // Turn 4: tool-less sidecar request (e.g. title generation) runs stateless on a fresh thread
+  // without polluting or overwriting the tool-bearing main thread
   await executeSncsChat(
     acct,
     {
@@ -1729,14 +1730,38 @@ test("resumed thread sends incremental <tools_update> when toolset changes acros
         { role: "assistant", content: "done" },
         { role: "user", content: "Summarize findings" },
         { role: "assistant", content: "done" },
-        { role: "user", content: "Answer directly without tools" },
+        { role: "user", content: "Generate a concise 3-7 word title" },
       ],
     },
     { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
   )
   assert.equal(sentPayloads.length, 4)
-  assert.equal(sentPayloads[3].thread_id, tid)
-  assert.match(sentPayloads[3].text, /<tools_update>[\s\S]*disabled[\s\S]*<\/tools_update>/)
+  assert.notEqual(sentPayloads[3].thread_id, tid, "tool-less sidecar must not attach to tool-bearing main thread")
+  assert.ok(!sentPayloads[3].text.includes("<tools_update>"), "stateless sidecar should not emit <tools_update>")
+
+  // Turn 5: subsequent tool-bearing turn still resumes the original main thread cleanly
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool, mcpTool],
+      messages: [
+        { role: "system", content: "Workspace agent" },
+        { role: "user", content: "Start auditing" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Now search docs with MCP" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Summarize findings" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Continue main audit" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
+  )
+  assert.equal(sentPayloads.length, 5)
+  assert.equal(sentPayloads[4].thread_id, tid, "main thread must remain intact in cache after sidecar ran")
+  assert.ok(!sentPayloads[4].text.includes("<tools_update>"))
 
   // Large <tools_update> (50 verbose MCP tools added on resume -> > 62 KB raw) gets compacted cleanly by Stage 1 under 62 KB
   const manyVerboseTools = Array.from({ length: 50 }, (_, i) => ({
@@ -1770,4 +1795,179 @@ test("resumed thread sends incremental <tools_update> when toolset changes acros
   assert.ok(bulkBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `compacted <tools_update> frame must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${bulkBytes}`)
   assert.ok(compactResume.userMessagePayload.text.includes("<tools_update>"))
   assert.ok(compactResume.userMessagePayload.text.includes("mcp_bulk_0(query*: string"))
+})
+
+test("tool-less title sidecar does not hijack tc: or main thread, and inflight lock serializes concurrent streaming turns", async () => {
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-lock", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "lock-acct" }
+  const readTool = {
+    type: "function",
+    function: { name: "read_file", description: "Read file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+  }
+
+  // 1. Seed a tool-bearing main thread that emitted 2 tool calls
+  let activeToolCallIds = []
+  let mainThreadId = ""
+  const seedCalls = []
+  const SeedWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") seedCalls.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({
+        type: "text_delta",
+        payload: {
+          delta:
+            '<tool_call>{"name":"read_file","arguments":{"path":"a.mjs"}}</tool_call>' +
+            '<tool_call>{"name":"read_file","arguments":{"path":"b.mjs"}}</tool_call>',
+        },
+      })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const seedRes = await executeSncsChat(
+    acct,
+    { model: "balanced", stream: false, tools: [readTool], messages: [{ role: "user", content: "Inspect a.mjs and b.mjs" }] },
+    { WebSocket: SeedWS, threadStore: store, sessionId: "zed-sess-1" },
+  )
+  const seedJson = await seedRes.json()
+  activeToolCallIds = seedJson.choices[0].message.tool_calls.map((c) => c.id)
+  assert.equal(activeToolCallIds.length, 2)
+  mainThreadId = seedCalls[0].thread_id
+
+  // 2. Zed fires title-gen sidecar (tools: [], 2 tool_results + trailing user prompt) AND main continuation concurrently
+  const secondRoundPayloads = []
+  const FastWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") secondRoundPayloads.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  const assistantToolMsg = {
+    role: "assistant",
+    content: null,
+    tool_calls: activeToolCallIds.map((id, i) => ({
+      id,
+      type: "function",
+      function: { name: "read_file", arguments: JSON.stringify({ path: i === 0 ? "a.mjs" : "b.mjs" }) },
+    })),
+  }
+  const toolResultMsgs = [
+    { role: "tool", tool_call_id: activeToolCallIds[0], name: "read_file", content: "FILE_A_BODY" },
+    { role: "tool", tool_call_id: activeToolCallIds[1], name: "read_file", content: "FILE_B_BODY" },
+  ]
+  const [titleRes, mainRes] = await Promise.all([
+    executeSncsChat(
+      acct,
+      {
+        model: "balanced",
+        stream: false,
+        tools: [],
+        messages: [
+          { role: "user", content: "Inspect a.mjs and b.mjs" },
+          assistantToolMsg,
+          ...toolResultMsgs,
+          { role: "user", content: "Generate a concise 3-7 word title" },
+        ],
+      },
+      { WebSocket: FastWS, threadStore: store, sessionId: "zed-sess-1" },
+    ),
+    executeSncsChat(
+      acct,
+      {
+        model: "balanced",
+        stream: false,
+        tools: [readTool],
+        messages: [
+          { role: "user", content: "Inspect a.mjs and b.mjs" },
+          assistantToolMsg,
+          ...toolResultMsgs,
+        ],
+      },
+      { WebSocket: FastWS, threadStore: store, sessionId: "zed-sess-1" },
+    ),
+  ])
+  assert.equal(titleRes.status, 200)
+  assert.equal(mainRes.status, 200)
+  const titlePayload = secondRoundPayloads.find((p) => p.text.includes("Generate a concise 3-7 word title"))
+  const mainPayload = secondRoundPayloads.find((p) => !p.text.includes("Generate a concise 3-7 word title"))
+  assert.ok(titlePayload && mainPayload)
+  assert.notEqual(titlePayload.thread_id, mainThreadId, "title-gen sidecar must run on isolated stateless thread")
+  assert.equal(mainPayload.thread_id, mainThreadId, "main continuation must resume mainThreadId cleanly")
+  assert.ok(!mainPayload.text.includes("Generate a concise 3-7 word title"))
+
+  // 3. Inflight lock holds across full SSE stream until message_complete, then second request re-checks cache
+  const events = []
+  let finishStreamA = null
+  let wsCount = 0
+  const ControlledWS = makeMockWebSocketClass((ws) => {
+    const idx = ++wsCount
+    events.push(`ws_open_${idx}`)
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (idx === 1) {
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "stream-A-part1" } })
+        finishStreamA = () => {
+          events.push("stream_A_completing")
+          ws.emitAidpEvent({ type: "text_delta", payload: { delta: "-part2" } })
+          ws.emitAidpEvent({ type: "message_complete", payload: {} })
+        }
+      } else {
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "reply-B" } })
+        ws.emitAidpEvent({ type: "message_complete", payload: {} })
+      }
+    })
+  })
+
+  // Start streaming Request A on mainThreadId
+  const reqAMsgs = [
+    { role: "user", content: "Inspect a.mjs and b.mjs" },
+    assistantToolMsg,
+    ...toolResultMsgs,
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "Turn A" },
+  ]
+  const resA = await executeSncsChat(
+    acct,
+    { model: "balanced", stream: true, tools: [readTool], messages: reqAMsgs },
+    { WebSocket: ControlledWS, threadStore: store, sessionId: "zed-sess-1" },
+  )
+  assert.equal(resA.status, 200)
+  // resA has ALREADY resolved (stream started!), but message_complete has NOT arrived yet.
+  // Launch concurrent Request B targeting the same mainThreadId.
+  const reqBPromise = executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool],
+      messages: [...reqAMsgs, { role: "assistant", content: "stream-A-part1-part2" }, { role: "user", content: "Turn B" }],
+    },
+    { WebSocket: ControlledWS, threadStore: store, sessionId: "zed-sess-1" },
+  )
+  await new Promise((r) => setTimeout(r, 25))
+  assert.equal(wsCount, 1, "Request B MUST wait for Request A's SSE stream to finish before opening its WebSocket")
+
+  // Now complete Request A's SSE stream -> Request B wakes up, re-looks up cache, and opens ws #2
+  finishStreamA()
+  const [textA, resB] = await Promise.all([resA.text(), reqBPromise])
+  assert.ok(textA.includes("stream-A-part1"))
+  assert.ok(textA.includes("-part2"))
+  assert.equal((await resB.json()).choices[0].message.content, "reply-B")
+  assert.deepEqual(events, ["ws_open_1", "stream_A_completing", "ws_open_2"])
 })

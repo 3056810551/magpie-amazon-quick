@@ -668,6 +668,10 @@ function formatConvoBlocks(msgs) {
  */
 export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS) {
   const byKey = new Map()
+  const inflight = new Map()
+
+  const entryHasTools = (entry) =>
+    Boolean(entry?.hasTools || (entry?.toolMap && Object.keys(entry.toolMap).length > 0))
 
   const prune = (now) => {
     for (const [k, v] of byKey) {
@@ -693,25 +697,63 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
   }
 
   return {
-    lookup(accountKey, sessionId, toolsSig, nextSysText, convoMessages) {
+    getInflight(threadId) {
+      return threadId ? inflight.get(threadId) || null : null
+    },
+    acquire(threadId) {
+      if (!threadId) return () => {}
+      let done = false
+      let resolveDone
+      const promise = new Promise((resolve) => {
+        resolveDone = resolve
+      })
+      inflight.set(threadId, promise)
+      return () => {
+        if (done) return
+        done = true
+        if (inflight.get(threadId) === promise) inflight.delete(threadId)
+        resolveDone()
+      }
+    },
+    hasToolThread(accountKey, sessionId, convoMessages) {
+      if (sessionId) {
+        const s = touch(`sess:${accountKey}|${sessionId}`)
+        if (s && s.accountKey === accountKey && entryHasTools(s)) return true
+      }
+      if (Array.isArray(convoMessages) && convoMessages.length) {
+        const firstHash = messageDigest(convoMessages[0])
+        const u = touch(`user0:${accountKey}|${firstHash}`)
+        if (u && u.accountKey === accountKey && entryHasTools(u)) return true
+        for (let i = convoMessages.length - 1; i >= 0; i--) {
+          const m = convoMessages[i]
+          if (String(m?.role || "").toLowerCase() !== "tool") continue
+          const tcId = String(m?.tool_call_id || "")
+          if (!tcId) continue
+          const t = touch(`tc:${accountKey}|${tcId}`)
+          if (t && t.accountKey === accountKey && entryHasTools(t)) return true
+        }
+      }
+      return false
+    },
+    lookup(accountKey, sessionId, toolsSig, nextSysText, convoMessages, lookupOpts = {}) {
       if (!Array.isArray(convoMessages) || convoMessages.length < 2) return null
+      const reqHasTools = typeof lookupOpts === "boolean" ? lookupOpts : lookupOpts?.hasTools !== false
       const hashes = convoMessages.map(messageDigest)
       const roleOf = (m) => String(m?.role || "").toLowerCase()
 
-      // 1. High-priority match by active tool_call_id in trailing tool results (immune to IDE assistant/user reformatting)
-      let trailingAssistantSeen = false
-      for (let i = convoMessages.length - 1; i >= 1; i--) {
-        const r = roleOf(convoMessages[i])
-        if (r === "assistant") {
-          trailingAssistantSeen = true
-          break
-        }
-        if (r === "tool" && !trailingAssistantSeen) {
+      // 1. High-priority match by active tool_call_id in contiguous trailing tool results.
+      // Stop immediately on any non-tool message (e.g. a trailing `user` title-generation prompt)
+      // and never attach a tool-less request onto a tool-bearing thread.
+      if (reqHasTools) {
+        for (let i = convoMessages.length - 1; i >= 1; i--) {
+          const r = roleOf(convoMessages[i])
+          if (r !== "tool") break
           const tcId = String(convoMessages[i]?.tool_call_id || "")
           if (!tcId) continue
           const tcKey = `tc:${accountKey}|${tcId}`
           const entry = touch(tcKey)
           if (!entry || entry.accountKey !== accountKey) continue
+          if (!reqHasTools && entryHasTools(entry)) continue
           let deltaStart = i
           while (deltaStart > 0 && roleOf(convoMessages[deltaStart - 1]) === "tool") {
             deltaStart--
@@ -742,6 +784,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         const entry = touch(k)
         if (!entry) continue
         if (entry.accountKey !== accountKey) continue
+        if (!reqHasTools && entryHasTools(entry)) continue
         const prefixLen = entry.msgHashes.length
         if (convoMessages.length < prefixLen + 2) continue
         let prefixOk = true
@@ -818,6 +861,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     },
     clear() {
       byKey.clear()
+      inflight.clear()
     },
   }
 }
@@ -1330,6 +1374,33 @@ export function stripReasoningEnabled(opts = {}) {
  * or a completed OpenAI JSON Response. Reuses cached `threadId` incrementally when the prefix matches,
  * transparently falling back to a fresh `threadId` if a resumed thread fails before streaming begins.
  */
+function waitForInflight(pending, signal) {
+  if (!signal) return pending
+  if (signal.aborted) {
+    const err = new Error("Request aborted")
+    err.status = 499
+    return Promise.reject(err)
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      const err = new Error("Request aborted")
+      err.status = 499
+      reject(err)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    pending.then(
+      () => {
+        signal.removeEventListener("abort", onAbort)
+        resolve()
+      },
+      () => {
+        signal.removeEventListener("abort", onAbort)
+        resolve()
+      },
+    )
+  })
+}
+
 export async function executeSncsChat(a, openaiBody, opts = {}) {
   const WS = opts.WebSocket ?? globalThis.WebSocket
   if (typeof WS !== "function") {
@@ -1340,6 +1411,8 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   const accountKey = accountKeyOf(a)
 
   let resumeState = null
+  let releaseInflight = null
+
   if (stateful) {
     const rawMessages = Array.isArray(openaiBody?.messages) ? openaiBody.messages : []
     const sysParts = []
@@ -1358,14 +1431,52 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     const toolChoice = openaiBody?.tool_choice
     const hasTools = tools.length > 0 && toolChoice !== "none"
     const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
-    resumeState = threadStore.lookup(accountKey, opts.sessionId || "", toolsSig, sysParts.join("\n\n"), convo)
+    const sysJoined = sysParts.join("\n\n")
+    const sessionId = opts.sessionId || ""
+
+    // Tool-less sidecar requests (e.g. Zed title generation / summarization) sharing a tool-bearing
+    // main conversation MUST stay completely stateless so they neither pollute the server thread
+    // nor overwrite the main thread's cache entries.
+    if (!hasTools && threadStore.hasToolThread?.(accountKey, sessionId, convo)) {
+      return await runSncsTurn(a, openaiBody, {
+        ...opts,
+        stateful: false,
+        resumeState: null,
+        threadStore: null,
+        accountKey,
+        WS,
+      })
+    }
+
+    const doLookup = () => threadStore.lookup(accountKey, sessionId, toolsSig, sysJoined, convo, { hasTools })
+    resumeState = doLookup()
+    while (resumeState?.threadId) {
+      const pending = threadStore.getInflight?.(resumeState.threadId)
+      if (!pending) break
+      await waitForInflight(pending, opts.signal)
+      resumeState = doLookup()
+    }
+    if (resumeState?.threadId && threadStore.acquire) {
+      releaseInflight = threadStore.acquire(resumeState.threadId)
+    }
   }
 
   try {
-    return await runSncsTurn(a, openaiBody, { ...opts, resumeState, accountKey, threadStore, WS })
+    return await runSncsTurn(a, openaiBody, {
+      ...opts,
+      resumeState,
+      accountKey,
+      threadStore,
+      WS,
+      onTurnDone: releaseInflight,
+    })
   } catch (err) {
-    if (resumeState && err?.status !== 401 && !opts.signal?.aborted) {
+    const canRetryFresh = Boolean(resumeState && err?.status !== 401 && !opts.signal?.aborted)
+    if (canRetryFresh) {
       threadStore.invalidate(accountKey, opts.sessionId || "", resumeState.threadId)
+    }
+    releaseInflight?.()
+    if (canRetryFresh) {
       return await runSncsTurn(a, openaiBody, { ...opts, resumeState: null, accountKey, threadStore, WS })
     }
     throw err
@@ -1439,7 +1550,7 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
 }
 
 async function runSncsTurn(a, openaiBody, ctx) {
-  const { WS, accountKey, threadStore, ...opts } = ctx
+  const { WS, accountKey, threadStore, onTurnDone, ...opts } = ctx
   const gateway = isGatewayProvider(a.providerType)
   const stripReasoning = stripReasoningEnabled(opts)
   const reqPlan = openaiToSncsRequest(openaiBody, opts)
@@ -1571,12 +1682,15 @@ async function runSncsTurn(a, openaiBody, ctx) {
       if (!settledInitial) {
         settledInitial = true
         reject(err)
-      } else if (sseController) {
-        try {
-          sseController.enqueue(sseEnc.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`))
-          sseController.enqueue(sseEnc.encode("data: [DONE]\n\n"))
-          sseController.close()
-        } catch {}
+      } else {
+        if (sseController) {
+          try {
+            sseController.enqueue(sseEnc.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`))
+            sseController.enqueue(sseEnc.encode("data: [DONE]\n\n"))
+            sseController.close()
+          } catch {}
+        }
+        onTurnDone?.()
       }
     }
 
@@ -1592,6 +1706,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
       threadStore.commit(accountKey, opts.sessionId || "", {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
+        hasTools: Boolean(reqPlan.hasTools),
         toolsSig: reqPlan.toolsSig,
         toolMap: reqPlan.toolMap,
         sysText: reqPlan.rawSystemText,
@@ -1668,6 +1783,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
         )
       }
       cleanup()
+      onTurnDone?.()
     }
 
     const openSseStream = () => {
@@ -1681,6 +1797,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
         cancel() {
           finished = true
           cleanup()
+          onTurnDone?.()
         },
       })
       resolve(
