@@ -2015,3 +2015,80 @@ test("tool-less title sidecar does not hijack tc: or main thread, and inflight l
   assert.equal((await resB.json()).choices[0].message.content, "reply-B")
   assert.deepEqual(events, ["ws_open_1", "stream_A_completing", "ws_open_2"])
 })
+
+test("CJK language detection strips <context>/code blocks and persists across resumed tool-result turns", async () => {
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-lang", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "lang-acct" }
+  const readTool = {
+    type: "function",
+    function: { name: "read_file", description: "Read file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+  }
+
+  // 1. Short Chinese user prose wrapped in large English <context> and fenced code still detects "zh"
+  const userWithContext =
+    "<context>\nActive file: src/bridge.mjs\n" +
+    "export function longEnglishBoilerplateIdentifier() { return true }\n".repeat(20) +
+    "</context>\n```js\nfunction parseToolBlock(openTag, inner) { return inner }\n```\n请帮我检查这段代码"
+  const sentPayloads = []
+  let turn = 0
+  const MockWS = makeMockWebSocketClass((ws) => {
+    turn++
+    const curTurn = turn
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sentPayloads.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({
+        type: "text_delta",
+        payload: {
+          delta:
+            curTurn === 1
+              ? '<tool_call>{"name":"read_file","arguments":{"path":"bridge.mjs"}}</tool_call>'
+              : "检查完成",
+        },
+      })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  const r1 = await executeSncsChat(
+    acct,
+    { model: "balanced", stream: false, tools: [readTool], messages: [{ role: "user", content: userWithContext }] },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-lang-1", locale: "en-US" },
+  )
+  const j1 = await r1.json()
+  const tcId = j1.choices[0].message.tool_calls[0].id
+  assert.match(sentPayloads[0].custom_prompt, /4\. Language Consistency:[\s\S]*Chinese/)
+
+  // 2. Turn 2 resumes with ONLY pure English code in tool_result -> cached lang="zh" still preserves rule #4
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool],
+      messages: [
+        { role: "user", content: userWithContext },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: tcId, type: "function", function: { name: "read_file", arguments: '{"path":"bridge.mjs"}' } }],
+        },
+        { role: "tool", tool_call_id: tcId, name: "read_file", content: "export function pureEnglishCode() {\n  return 42\n}\n".repeat(40) },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-lang-1", locale: "en-US" },
+  )
+  assert.equal(sentPayloads.length, 2)
+  assert.equal(sentPayloads[1].thread_id, sentPayloads[0].thread_id)
+  assert.match(
+    sentPayloads[1].custom_prompt,
+    /4\. Language Consistency:[\s\S]*Chinese/,
+    "resumed English-only tool_result turn must preserve cached Chinese language consistency rule",
+  )
+})

@@ -490,13 +490,23 @@ const KANA_RE = /[\u3040-\u30ff]/
 const HANGUL_RE = /[\uac00-\ud7af]/
 const LATIN_LETTER_RE = /[A-Za-z]/g
 
+function stripNonProseForLangDetect(text) {
+  return String(text ?? "")
+    .replace(/<context\b[^>]*>[\s\S]*?<\/context>/gi, " ")
+    .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/gi, " ")
+    .replace(/<ide_[a-z_]+\b[^>]*>[\s\S]*?<\/ide_[a-z_]+>/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`\n]*`/g, " ")
+}
+
 function detectConversationLanguage(opts = {}, messages = []) {
   const localeTag = String(opts.locale || "").toLowerCase().split(/[-_]/)[0]
   if (CJK_LANGUAGES[localeTag]) return localeTag
-  // Many users run an en-US OS locale while chatting in Chinese, so also read the recent turns.
+  // Many users run an en-US OS locale while chatting in Chinese, so also read recent user prose
+  // after stripping IDE <context> blocks and fenced/inline code.
   const text = messages
     .slice(-4)
-    .map((m) => textFromContent(m?.content))
+    .map((m) => stripNonProseForLangDetect(textFromContent(m?.content)))
     .join("\n")
   const cjk = (text.match(CJK_TEXT_RE) || []).length
   const latin = (text.match(LATIN_LETTER_RE) || []).length
@@ -768,6 +778,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
             systemUpdate,
             toolsChanged,
             prevToolMap: entry.toolMap || null,
+            lang: entry.lang || "",
             allHashes: hashes,
             toolsSig,
           }
@@ -811,6 +822,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
           systemUpdate,
           toolsChanged,
           prevToolMap: entry.toolMap || null,
+          lang: entry.lang || "",
           allHashes: hashes,
           toolsSig,
         }
@@ -951,8 +963,17 @@ export function openaiToSncsRequest(body, opts = {}) {
     return parts.join("\n\n")
   }
 
+  const userMsgs = convoMessages.filter((m) => String(m?.role || "").toLowerCase() === "user")
+  const latestIsUser =
+    outboundMsgs.length > 0 && String(outboundMsgs[outboundMsgs.length - 1]?.role || "").toLowerCase() === "user"
+  const detectedLang = detectConversationLanguage(opts, userMsgs)
+  const lang =
+    resumeState?.lang && (!latestIsUser || !CJK_LANGUAGES[detectedLang])
+      ? resumeState.lang
+      : detectedLang
+
   const customPrompt = hasTools
-    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", detectConversationLanguage(opts, outboundMsgs))
+    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", lang)
     : opts.customPrompt || null
 
   const buildUserPayload = (textVal) => ({
@@ -1112,6 +1133,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     modelId,
     hasTools,
     isResume,
+    lang,
     toolsSig,
     toolMap,
     rawSystemText,
@@ -1706,6 +1728,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
         hasTools: Boolean(reqPlan.hasTools),
+        lang: reqPlan.lang || "",
         toolsSig: reqPlan.toolsSig,
         toolMap: reqPlan.toolMap,
         sysText: reqPlan.rawSystemText,
