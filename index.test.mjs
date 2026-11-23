@@ -1492,10 +1492,11 @@ test("parallel tool_result blocks in current turn are protected, proportionally 
   assert.ok(inline3.length > 8_000, `r3 should get proportional budget, got ${inline3.length}`)
   assert.ok(Math.abs(inline1.length - inline3.length) < 1_000, `equal-sized parallel results should get balanced budgets: ${inline1.length} vs ${inline3.length}`)
 
-  // Informative truncation markers report original length, attachment hint, and smaller line-range re-read hint
+  // Informative truncation markers report original length and smaller line-range re-read hint,
+  // WITHOUT prematurely claiming prompt_context.txt before upload succeeds
   for (const [id, block] of [["r1", inline1], ["r2", inline2], ["r3", inline3]]) {
     assert.match(block, /trimmed \d+ of \d+ chars to fit 64KB frame/, `${id} should report original/omitted length`)
-    assert.match(block, /prompt_context\.txt/, `${id} should mention prompt_context.txt attachment`)
+    assert.ok(!block.includes("prompt_context.txt"), `${id} must not claim prompt_context.txt before upload succeeds`)
     assert.match(block, /smaller line range/i, `${id} should hint to re-read with smaller line range`)
   }
 
@@ -1526,4 +1527,78 @@ test("parallel tool_result blocks in current turn are protected, proportionally 
   assert.ok(resumeReq.overflowUserText.includes("X".repeat(30_000)), "resume overflowUserText must preserve full p1")
   assert.ok(resumeReq.overflowUserText.includes("Y".repeat(30_000)), "resume overflowUserText must preserve full p3")
   assert.ok(resumeReq.overflowUserText.includes(shortOut), "resume overflowUserText must preserve p2")
+})
+
+test("prompt_context.txt attachment note is added only after upload succeeds and final frame stays within 62 KB", async () => {
+  assert.equal(MAX_USER_MESSAGE_FRAME_BYTES, 62_000)
+  const acct = { providerType: "social", access: "tok-att", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "att-acct" }
+  const tools = [
+    {
+      type: "function",
+      function: { name: "read_file", description: "Read", parameters: { type: "object", properties: { path: { type: "string" } } } },
+    },
+  ]
+  const body = {
+    model: "balanced",
+    stream: false,
+    tools,
+    messages: [
+      { role: "user", content: "Audit file" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a.mjs"}' } },
+          { id: "c2", type: "function", function: { name: "read_file", arguments: '{"path":"b.mjs"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "c1", name: "read_file", content: "A".repeat(32_000) },
+      { role: "tool", tool_call_id: "c2", name: "read_file", content: "B".repeat(32_000) },
+    ],
+  }
+
+  const runWithUploader = async (uploadAttachment) => {
+    const sentFrames = []
+    const MockWS = makeMockWebSocketClass((ws) => {
+      ws.readyState = 1
+      ws.onopen?.()
+      queueMicrotask(() => {
+        for (const raw of ws.sent) {
+          const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+          const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+          if (inner.type === "user_message") sentFrames.push({ bytes: Buffer.from(raw).byteLength, payload: inner.payload })
+        }
+        ws.emitAidpEvent({ type: "session_established", payload: {} })
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+        ws.emitAidpEvent({ type: "message_complete", payload: {} })
+      })
+    })
+    await executeSncsChat(acct, body, { WebSocket: MockWS, uploadAttachment, stateful: false })
+    assert.equal(sentFrames.length, 1)
+    return sentFrames[0]
+  }
+
+  // 1. Upload succeeds -> prompt_context.txt attached, note placed before <client_tool_directive>, wire frame <= 62KB
+  const okFrame = await runWithUploader(async (_a, file) => ({
+    type: "file",
+    name: file.name,
+    size: file.bytes.byteLength,
+    mimeType: file.mimeType,
+    path: `/workspace/attached_files/${file.name}`,
+    attachmentId: "att-ok-1",
+    contentSha256: "sha-ok",
+  }))
+  assert.ok(okFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES, `final frame with attachment + note must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${okFrame.bytes}`)
+  assert.equal(okFrame.payload.attachments?.[0]?.name, "prompt_context.txt")
+  assert.match(okFrame.payload.text, /attached as prompt_context\.txt/)
+  assert.ok(okFrame.payload.text.endsWith("</client_tool_directive>"), "note must be inserted before trailing <client_tool_directive>")
+
+  // 2. Upload fails -> no attachment and NO misleading prompt_context.txt claim in text
+  const failFrame = await runWithUploader(async () => {
+    throw new Error("DLP upload failed")
+  })
+  assert.ok(failFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES)
+  assert.equal(failFrame.payload.attachments, undefined)
+  assert.ok(!failFrame.payload.text.includes("prompt_context.txt"), "must NOT mention prompt_context.txt when upload fails")
+  assert.match(failFrame.payload.text, /smaller line range/i)
 })

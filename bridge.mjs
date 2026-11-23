@@ -295,7 +295,10 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
   return null
 }
 
-export const MAX_USER_MESSAGE_FRAME_BYTES = 58_000
+export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
+const OVERFLOW_ATTACHMENT_NOTE =
+  "[Note: Full untruncated content of the trimmed current turn is attached as prompt_context.txt.]"
+const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 600
 
 function truncateMiddle(str, maxChars, optsOrMarker = undefined) {
   const s = String(str ?? "")
@@ -305,7 +308,6 @@ function truncateMiddle(str, maxChars, optsOrMarker = undefined) {
     if (opts.marker) return opts.marker
     const base = `trimmed ${omitted} of ${s.length} chars to fit 64KB frame`
     const hints = []
-    if (opts.hasAttachment) hints.push("full text attached as prompt_context.txt")
     if (opts.isToolResult) hints.push("re-read with a smaller line range if exact omitted lines are needed")
     return `\n...[${base}${hints.length ? `; ${hints.join("; ")}` : ""}]...\n`
   }
@@ -921,6 +923,11 @@ export function openaiToSncsRequest(body, opts = {}) {
     const origProtectedRoles = protectedSlice.map((b) => b.role)
     const origProtectedLens = origProtectedTexts.map((t) => t.length)
     overflowUserText = origProtectedTexts.filter(Boolean).join("\n\n")
+    const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
+    const stage4MaxBytes =
+      mayAttachOverflow && maxFrameBytes > OVERFLOW_ATTACHMENT_RESERVE_BYTES + 2048
+        ? maxFrameBytes - OVERFLOW_ATTACHMENT_RESERVE_BYTES
+        : maxFrameBytes
 
     const applyProtectedBudget = (budgetChars) => {
       const budgets = allocateProportionalBudgets(origProtectedLens, budgetChars)
@@ -933,7 +940,6 @@ export function openaiToSncsRequest(body, opts = {}) {
             orig.length > targetLen
               ? truncateMiddle(orig, targetLen, {
                   isToolResult: origProtectedRoles[k] === "tool",
-                  hasAttachment: true,
                 })
               : orig,
         }
@@ -944,7 +950,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     const totalOrigChars = origProtectedLens.reduce((a, b) => a + b, 0)
     const preBlocks = blocks.slice(0, protectedStart)
     const baseBytes = measure(composeText(sysText, toolsText, preBlocks))
-    const availableWireBytes = Math.max(0, maxFrameBytes - baseBytes)
+    const availableWireBytes = Math.max(0, stage4MaxBytes - baseBytes)
     const currentProtectedBytes = Math.max(1, measure(text) - baseBytes)
     const minTotalBudget = protectedSlice.length * 64
     let totalBudget = Math.max(
@@ -953,7 +959,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     )
 
     applyProtectedBudget(totalBudget)
-    let over = measure(text) - maxFrameBytes
+    let over = measure(text) - stage4MaxBytes
     while (over > 0 && totalBudget > minTotalBudget) {
       const cutByOver = Math.max(200, Math.ceil(over * 0.75))
       const curProtectedBytes = Math.max(1, measure(text) - baseBytes)
@@ -965,15 +971,15 @@ export function openaiToSncsRequest(body, opts = {}) {
         totalBudget = nextBudget
       }
       applyProtectedBudget(totalBudget)
-      over = measure(text) - maxFrameBytes
+      over = measure(text) - stage4MaxBytes
     }
 
-    // Last-resort fallback: if a pre-protected paired block still pushes us over maxFrameBytes, drop it
+    // Last-resort fallback: if a pre-protected paired block still pushes us over stage4MaxBytes, drop it
     while (over > 0 && protectedStart > 0) {
       blocks.shift()
       protectedStart--
       text = composeText(sysText, toolsText, blocks)
-      over = measure(text) - maxFrameBytes
+      over = measure(text) - stage4MaxBytes
     }
   }
 
@@ -1364,6 +1370,14 @@ async function runSncsTurn(a, openaiBody, ctx) {
   const attachments = await prepareTurnAttachments(a, reqPlan, opts)
   if (attachments.length) {
     reqPlan.userMessagePayload.attachments = attachments
+    if (reqPlan.overflowUserText && attachments.some((att) => att?.name === "prompt_context.txt")) {
+      const curText = String(reqPlan.userMessagePayload.text || "")
+      const directiveIdx = curText.lastIndexOf("<client_tool_directive>")
+      reqPlan.userMessagePayload.text =
+        directiveIdx > 0
+          ? `${curText.slice(0, directiveIdx).trimEnd()}\n\n${OVERFLOW_ATTACHMENT_NOTE}\n\n${curText.slice(directiveIdx)}`
+          : `${curText}\n\n${OVERFLOW_ATTACHMENT_NOTE}`
+    }
   }
 
   const surface = surfaceTypeForPlatform(opts.platform)
