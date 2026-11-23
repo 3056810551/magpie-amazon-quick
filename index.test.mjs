@@ -1426,3 +1426,104 @@ test("deviceCodeSignIn supports headless/VPS OAuth device polling, slow_down, ab
   assert.equal(denRes.type, "failed")
   assert.match(denRes.error, /denied/i)
 })
+
+test("parallel tool_result blocks in current turn are protected, proportionally budgeted, and fully spilled to overflowUserText", () => {
+  const seg1 = "SEG1_HEAD\n" + "A".repeat(22_000) + "\nSEG1_TAIL"
+  const seg2 = "SEG2_HEAD\n" + "B".repeat(22_000) + "\nSEG2_TAIL"
+  const seg3 = "SEG3_HEAD\n" + "C".repeat(22_000) + "\nSEG3_TAIL"
+  const oldTool = "OLD_TOOL_" + "Z".repeat(5_000)
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read file lines",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    },
+  ]
+
+  // 1. Full-history request with older turns + null message + paired assistant tool_calls + 3 parallel read_file results
+  const fullReq = openaiToSncsRequest({
+    model: "balanced",
+    tools,
+    messages: [
+      { role: "system", content: "You are a code auditor." },
+      { role: "user", content: "Old turn question" },
+      null,
+      { role: "assistant", content: "Old answer", tool_calls: [{ id: "old_1", type: "function", function: { name: "read_file", arguments: '{"path":"old.mjs"}' } }] },
+      { role: "tool", tool_call_id: "old_1", name: "read_file", content: oldTool },
+      { role: "user", content: "Read bridge.mjs in 3 chunks" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "r1", type: "function", function: { name: "read_file", arguments: '{"path":"bridge.mjs","start":1,"end":555}' } },
+          { id: "r2", type: "function", function: { name: "read_file", arguments: '{"path":"bridge.mjs","start":556,"end":1100}' } },
+          { id: "r3", type: "function", function: { name: "read_file", arguments: '{"path":"bridge.mjs","start":1101,"end":1665}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "r1", name: "read_file", content: seg1 },
+      { role: "tool", tool_call_id: "r2", name: "read_file", content: seg2 },
+      { role: "tool", tool_call_id: "r3", name: "read_file", content: seg3 },
+    ],
+  })
+
+  const frameBytes = buildAidpInputFrame({ type: "user_message", payload: fullReq.userMessagePayload }).byteLength
+  assert.ok(frameBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `expected frame <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${frameBytes}`)
+
+  const outText = fullReq.userMessagePayload.text
+  // Paired assistant tool_call block preserved; older turns dropped
+  assert.ok(outText.includes('"start":1,"end":555'), "paired assistant tool_call block should survive Stage 2 shift")
+  assert.ok(!outText.includes("OLD_TOOL_"), "older tool result should be dropped before touching current turn")
+
+  // All 3 parallel tool results preserved inline with fair proportional budgets (far above old 600-char cap)
+  const extractResult = (id) => {
+    const m = outText.match(new RegExp(`<tool_result id="${id}" name="read_file">[\\s\\S]*?</tool_result>`))
+    assert.ok(m, `missing inline tool_result for ${id}`)
+    return m[0]
+  }
+  const inline1 = extractResult("r1")
+  const inline2 = extractResult("r2")
+  const inline3 = extractResult("r3")
+  assert.ok(inline1.length > 8_000, `r1 should get proportional budget, got ${inline1.length}`)
+  assert.ok(inline2.length > 8_000, `r2 should get proportional budget, got ${inline2.length}`)
+  assert.ok(inline3.length > 8_000, `r3 should get proportional budget, got ${inline3.length}`)
+  assert.ok(Math.abs(inline1.length - inline3.length) < 1_000, `equal-sized parallel results should get balanced budgets: ${inline1.length} vs ${inline3.length}`)
+
+  // Informative truncation markers report original length, attachment hint, and smaller line-range re-read hint
+  for (const [id, block] of [["r1", inline1], ["r2", inline2], ["r3", inline3]]) {
+    assert.match(block, /trimmed \d+ of \d+ chars to fit 64KB frame/, `${id} should report original/omitted length`)
+    assert.match(block, /prompt_context\.txt/, `${id} should mention prompt_context.txt attachment`)
+    assert.match(block, /smaller line range/i, `${id} should hint to re-read with smaller line range`)
+  }
+
+  // Full protected turn (all 3 tool results) spilled intact into overflowUserText
+  assert.ok(fullReq.overflowUserText.includes(seg1), "overflowUserText must contain full seg1")
+  assert.ok(fullReq.overflowUserText.includes(seg2), "overflowUserText must contain full seg2")
+  assert.ok(fullReq.overflowUserText.includes(seg3), "overflowUserText must contain full seg3")
+
+  // 2. Mixed-size parallel tool results on resume: short block stays 100% intact while large blocks split remaining budget
+  const shortOut = "On branch main\nnothing to commit, working tree clean"
+  const resumeReq = openaiToSncsRequest(
+    { model: "balanced", tools, messages: [{ role: "user", content: "ignored on resume" }] },
+    {
+      resumeState: {
+        threadId: "thread-par-1",
+        workingSessionId: "ws-par-1",
+        deltaMessages: [
+          { role: "tool", tool_call_id: "p1", name: "read_file", content: "L1_" + "X".repeat(30_000) },
+          { role: "tool", tool_call_id: "p2", name: "run_cmd", content: shortOut },
+          { role: "tool", tool_call_id: "p3", name: "read_file", content: "L2_" + "Y".repeat(30_000) },
+        ],
+      },
+    },
+  )
+  const resumeBytes = buildAidpInputFrame({ type: "user_message", payload: resumeReq.userMessagePayload }).byteLength
+  assert.ok(resumeBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `resume frame <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${resumeBytes}`)
+  assert.ok(resumeReq.userMessagePayload.text.includes(shortOut), "small parallel tool result must remain completely untruncated")
+  assert.ok(resumeReq.overflowUserText.includes("X".repeat(30_000)), "resume overflowUserText must preserve full p1")
+  assert.ok(resumeReq.overflowUserText.includes("Y".repeat(30_000)), "resume overflowUserText must preserve full p3")
+  assert.ok(resumeReq.overflowUserText.includes(shortOut), "resume overflowUserText must preserve p2")
+})

@@ -297,13 +297,63 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
 
 export const MAX_USER_MESSAGE_FRAME_BYTES = 58_000
 
-function truncateMiddle(str, maxChars, marker = "\n...[trimmed to fit frame limit]...\n") {
+function truncateMiddle(str, maxChars, optsOrMarker = undefined) {
   const s = String(str ?? "")
   if (s.length <= maxChars) return s
-  if (maxChars <= marker.length + 16) return s.slice(0, Math.max(0, maxChars))
-  const head = Math.floor((maxChars - marker.length) * 0.65)
-  const tail = maxChars - marker.length - head
+  const opts = typeof optsOrMarker === "string" ? { marker: optsOrMarker } : optsOrMarker || {}
+  const makeMarker = (omitted) => {
+    if (opts.marker) return opts.marker
+    const base = `trimmed ${omitted} of ${s.length} chars to fit 64KB frame`
+    const hints = []
+    if (opts.hasAttachment) hints.push("full text attached as prompt_context.txt")
+    if (opts.isToolResult) hints.push("re-read with a smaller line range if exact omitted lines are needed")
+    return `\n...[${base}${hints.length ? `; ${hints.join("; ")}` : ""}]...\n`
+  }
+  let marker = makeMarker(Math.max(1, s.length - maxChars))
+  if (maxChars <= marker.length + 16) {
+    marker = `\n...[trimmed ${Math.max(1, s.length - maxChars)}/${s.length} chars]...\n`
+  }
+  if (maxChars <= marker.length + 16) {
+    return s.slice(0, Math.max(0, maxChars))
+  }
+  const kept = maxChars - marker.length
+  const omitted = s.length - kept
+  const exactMarker = opts.marker ? marker : makeMarker(omitted)
+  if (maxChars > exactMarker.length + 16) {
+    marker = exactMarker
+  }
+  const finalKept = maxChars - marker.length
+  const head = Math.floor(finalKept * 0.65)
+  const tail = finalKept - head
   return s.slice(0, head) + marker + s.slice(s.length - tail)
+}
+
+function allocateProportionalBudgets(lengths, totalBudget) {
+  const n = lengths.length
+  if (n === 0) return []
+  const totalLen = lengths.reduce((a, b) => a + b, 0)
+  if (totalLen <= totalBudget) return [...lengths]
+  const minFloor = Math.min(256, Math.floor(totalBudget / n))
+  const budgets = new Array(n).fill(0)
+  let remainingBudget = totalBudget
+  let remainingLargeLen = 0
+  const largeIndices = []
+  for (let i = 0; i < n; i++) {
+    if (lengths[i] <= minFloor) {
+      budgets[i] = lengths[i]
+      remainingBudget -= lengths[i]
+    } else {
+      largeIndices.push(i)
+      remainingLargeLen += lengths[i]
+    }
+  }
+  const reserve = minFloor * largeIndices.length
+  const extra = Math.max(0, remainingBudget - reserve)
+  for (const idx of largeIndices) {
+    const share = remainingLargeLen > 0 ? Math.floor((extra * lengths[idx]) / remainingLargeLen) : 0
+    budgets[idx] = Math.min(lengths[idx], minFloor + share)
+  }
+  return budgets
 }
 
 function summarizeSchema(schema, depth = 0) {
@@ -518,11 +568,13 @@ function systemDeltaText(prevSys, nextSys, maxDiffChars = 20000) {
 }
 
 function formatConvoBlocks(msgs) {
-  if (msgs.length === 1 && String(msgs[0].role).toLowerCase() === "user" && !msgs[0].tool_calls?.length) {
-    return [textFromContent(msgs[0].content)]
+  if (msgs.length === 1 && String(msgs[0]?.role || "user").toLowerCase() === "user" && !msgs[0]?.tool_calls?.length) {
+    return [{ text: textFromContent(msgs[0].content), msgIndex: 0, role: "user" }]
   }
   const blocks = []
-  for (const msg of msgs) {
+  for (let idx = 0; idx < msgs.length; idx++) {
+    const msg = msgs[idx]
+    if (!msg || typeof msg !== "object") continue
     const role = String(msg.role || "user").toLowerCase()
     if (role === "assistant") {
       let content = textFromContent(msg.content)
@@ -539,16 +591,20 @@ function formatConvoBlocks(msgs) {
           .join("\n")
         content = content ? `${content}\n${calls}` : calls
       }
-      blocks.push(`Assistant:\n${content}`)
+      blocks.push({ text: `Assistant:\n${content}`, msgIndex: idx, role: "assistant" })
     } else if (role === "tool") {
       const callId = msg.tool_call_id || msg.name || "tool"
       const nameAttr = msg.name ? ` name="${msg.name}"` : ""
-      blocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
+      blocks.push({
+        text: `<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`,
+        msgIndex: idx,
+        role: "tool",
+      })
     } else {
-      blocks.push(`User:\n${textFromContent(msg.content)}`)
+      blocks.push({ text: `User:\n${textFromContent(msg.content)}`, msgIndex: idx, role: "user" })
     }
   }
-  return blocks.length ? blocks : ["Hello"]
+  return blocks.length ? blocks : [{ text: "Hello", msgIndex: 0, role: "user" }]
 }
 
 /**
@@ -757,9 +813,9 @@ export function openaiToSncsRequest(body, opts = {}) {
   const surfaceType = surfaceTypeForPlatform(opts.platform)
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
-  const composeText = (sysText, toolsText, blocks) => {
+  const composeText = (sysText, toolsText, blockList) => {
     const instrParts = isResume ? [] : [sysText, toolsText].filter(Boolean)
-    const bodyText = blocks.filter(Boolean).join("\n\n")
+    const bodyText = blockList.map((b) => (typeof b === "string" ? b : b?.text || "")).filter(Boolean).join("\n\n")
     const parts = []
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
     if (isResume && resumeState.systemUpdate) {
@@ -795,10 +851,23 @@ export function openaiToSncsRequest(body, opts = {}) {
 
   const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
 
-  let sysText = isResume ? "" : normalizeClientSystemText(rawSystemParts.join("\n\n"))
-  let blocks = [...convoBlocks]
+  const origSysText = isResume ? "" : normalizeClientSystemText(rawSystemParts.join("\n\n"))
+  let sysText = origSysText
+  let blocks = convoBlocks.map((b) => ({ ...b }))
   let toolsText = fullToolsPrompt
   let text = composeText(sysText, toolsText, blocks)
+
+  // Protected zone: everything in the current turn after the last assistant message
+  // (e.g., all parallel <tool_result> messages in the current round, or latest user turn).
+  let lastAssistantMsgIdx = -1
+  for (let i = outboundMsgs.length - 1; i >= 0; i--) {
+    if (String(outboundMsgs[i]?.role || "").toLowerCase() === "assistant") {
+      lastAssistantMsgIdx = i
+      break
+    }
+  }
+  let protectedStart = blocks.findIndex((b) => b.msgIndex > lastAssistantMsgIdx)
+  if (protectedStart < 0) protectedStart = Math.max(0, blocks.length - 1)
 
   // Stage 1: Compact verbose JSON tool schemas to concise typed signatures if over limit
   if (!isResume && measure(text) > maxFrameBytes && hasTools) {
@@ -806,43 +875,103 @@ export function openaiToSncsRequest(body, opts = {}) {
     text = composeText(sysText, toolsText, blocks)
   }
 
-  // Stage 2: Trim older turns / long tool results first, preserving the latest turn & directives
-  if (measure(text) > maxFrameBytes && blocks.length > 1) {
-    for (let i = 0; i < blocks.length - 1 && measure(text) > maxFrameBytes; i++) {
-      if (blocks[i].length > 800) {
-        blocks[i] = truncateMiddle(blocks[i], 600)
+  // Stage 2: Trim/drop ONLY blocks before the protected zone; preserve paired assistant tool_call block when shifting
+  if (measure(text) > maxFrameBytes && protectedStart > 0) {
+    for (let i = 0; i < protectedStart && measure(text) > maxFrameBytes; i++) {
+      if (blocks[i].text.length > 800) {
+        blocks[i] = {
+          ...blocks[i],
+          text: truncateMiddle(blocks[i].text, 600, { isToolResult: blocks[i].role === "tool" }),
+        }
         text = composeText(sysText, toolsText, blocks)
       }
     }
-    while (blocks.length > 2 && measure(text) > maxFrameBytes) {
+    const protectedHasTool = blocks.slice(protectedStart).some((b) => b.role === "tool")
+    let shiftLimit =
+      protectedHasTool && protectedStart > 0 && blocks[protectedStart - 1]?.role === "assistant"
+        ? protectedStart - 1
+        : protectedStart
+    while (shiftLimit > 0 && measure(text) > maxFrameBytes) {
       blocks.shift()
+      protectedStart--
+      shiftLimit--
       text = composeText(sysText, toolsText, blocks)
     }
   }
 
-  // Stage 3: Trim long system prompt text, leaving tools protocol and latest user turn intact
+  // Stage 3: Trim long system prompt text, leaving tools protocol and protected turn intact
   if (!isResume && measure(text) > maxFrameBytes && sysText) {
     const withoutSysBytes = measure(composeText("", toolsText, blocks))
-    const charBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
-    sysText = charBudget > 256 ? truncateMiddle(sysText, charBudget) : ""
+    let sysBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
+    sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
     text = composeText(sysText, toolsText, blocks)
     for (let over = measure(text) - maxFrameBytes; over > 0 && sysText.length > 0; over = measure(text) - maxFrameBytes) {
-      const nextLen = sysText.length - Math.max(200, Math.ceil(over * 0.75))
-      sysText = nextLen > 256 ? truncateMiddle(sysText, nextLen) : ""
+      sysBudget = sysBudget - Math.max(200, Math.ceil(over * 0.75))
+      sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
       text = composeText(sysText, toolsText, blocks)
     }
   }
 
-  // Stage 4: Final safety clamp on user body text so outbound frame stays under maxFrameBytes
+  // Stage 4: Spill full protected zone to overflowUserText (prompt_context.txt) and allocate
+  // inline char budgets proportionally across all protected blocks so parallel tool results are preserved fairly.
   let overflowUserText = ""
   if (measure(text) > maxFrameBytes && blocks.length) {
-    overflowUserText = blocks[blocks.length - 1]
+    const protectedSlice = blocks.slice(protectedStart)
+    const origProtectedTexts = protectedSlice.map((b) => b.text)
+    const origProtectedRoles = protectedSlice.map((b) => b.role)
+    const origProtectedLens = origProtectedTexts.map((t) => t.length)
+    overflowUserText = origProtectedTexts.filter(Boolean).join("\n\n")
+
+    const applyProtectedBudget = (budgetChars) => {
+      const budgets = allocateProportionalBudgets(origProtectedLens, budgetChars)
+      for (let k = 0; k < protectedSlice.length; k++) {
+        const orig = origProtectedTexts[k]
+        const targetLen = budgets[k]
+        blocks[protectedStart + k] = {
+          ...blocks[protectedStart + k],
+          text:
+            orig.length > targetLen
+              ? truncateMiddle(orig, targetLen, {
+                  isToolResult: origProtectedRoles[k] === "tool",
+                  hasAttachment: true,
+                })
+              : orig,
+        }
+      }
+      text = composeText(sysText, toolsText, blocks)
+    }
+
+    const totalOrigChars = origProtectedLens.reduce((a, b) => a + b, 0)
+    const preBlocks = blocks.slice(0, protectedStart)
+    const baseBytes = measure(composeText(sysText, toolsText, preBlocks))
+    const availableWireBytes = Math.max(0, maxFrameBytes - baseBytes)
+    const currentProtectedBytes = Math.max(1, measure(text) - baseBytes)
+    const minTotalBudget = protectedSlice.length * 64
+    let totalBudget = Math.max(
+      minTotalBudget,
+      Math.floor(totalOrigChars * (availableWireBytes / currentProtectedBytes) * 0.95),
+    )
+
+    applyProtectedBudget(totalBudget)
     let over = measure(text) - maxFrameBytes
-    let last = overflowUserText
-    while (over > 0 && last.length > 256) {
-      const cut = Math.max(200, Math.floor(over * 0.75))
-      last = truncateMiddle(last, Math.max(128, last.length - cut))
-      blocks[blocks.length - 1] = last
+    while (over > 0 && totalBudget > minTotalBudget) {
+      const cutByOver = Math.max(200, Math.ceil(over * 0.75))
+      const curProtectedBytes = Math.max(1, measure(text) - baseBytes)
+      const scaled = Math.floor(totalBudget * (availableWireBytes / curProtectedBytes) * 0.92)
+      const nextBudget = Math.max(minTotalBudget, Math.min(totalBudget - cutByOver, scaled))
+      if (nextBudget >= totalBudget) {
+        totalBudget = Math.max(minTotalBudget, totalBudget - cutByOver)
+      } else {
+        totalBudget = nextBudget
+      }
+      applyProtectedBudget(totalBudget)
+      over = measure(text) - maxFrameBytes
+    }
+
+    // Last-resort fallback: if a pre-protected paired block still pushes us over maxFrameBytes, drop it
+    while (over > 0 && protectedStart > 0) {
+      blocks.shift()
+      protectedStart--
       text = composeText(sysText, toolsText, blocks)
       over = measure(text) - maxFrameBytes
     }
