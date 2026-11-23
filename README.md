@@ -6,6 +6,9 @@
 
 <a id="中文说明"></a>
 
+> [!WARNING]
+> **停止维护公告**：本项目从现在起不再维护。推荐大家使用 **[magpie-aws-quick](https://github.com/httpdone/magpie-aws-quick)**（https://github.com/httpdone/magpie-aws-quick）。
+
 面向 **Amazon Quick**（AWS Quick / QuickWork 桌面端，`Amazon Quick.exe`）的 OpenCode 与 Magpie Provider 插件。
 
 兼容 **OpenCode 1.x**、**OpenCode 2.x** 及 **Magpie**，零外部 npm 依赖，并在 `package.json` 中内置了基于原版应用图标生成的 `magpie.icon` 图标。
@@ -97,6 +100,9 @@ MIT
 ---
 
 <a id="english"></a>
+
+> [!WARNING]
+> **Deprecated / Unmaintained**: This project is no longer maintained. We recommend using **[magpie-aws-quick](https://github.com/httpdone/magpie-aws-quick)** (https://github.com/httpdone/magpie-aws-quick) instead.
 
 OpenCode & Magpie provider plugin for **Amazon Quick** (AWS Quick / QuickWork desktop, `Amazon Quick.exe`).
 
