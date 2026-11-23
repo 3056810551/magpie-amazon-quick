@@ -934,7 +934,7 @@ export function openaiToSncsRequest(body, opts = {}) {
   const surfaceType = surfaceTypeForPlatform(opts.platform)
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
-  const composeText = (sysText, toolsText, blockList) => {
+  const composeText = (sysText, toolsText, blockList, note = "") => {
     const instrParts = isResume ? [] : [sysText, toolsText].filter(Boolean)
     const bodyText = blockList.map((b) => (typeof b === "string" ? b : b?.text || "")).filter(Boolean).join("\n\n")
     const parts = []
@@ -946,6 +946,7 @@ export function openaiToSncsRequest(body, opts = {}) {
       parts.push(`<tools_update>\n${toolsText}\n</tools_update>`)
     }
     if (bodyText) parts.push(bodyText)
+    if (note) parts.push(note)
     if (trailing) parts.push(trailing)
     return parts.join("\n\n")
   }
@@ -1039,6 +1040,7 @@ export function openaiToSncsRequest(body, opts = {}) {
   // Stage 4: Spill full protected zone to overflowUserText (prompt_context.txt) and allocate
   // inline char budgets proportionally across all protected blocks so parallel tool results are preserved fairly.
   let overflowUserText = ""
+  let textWithAttachmentNote = ""
   if (measure(text) > maxFrameBytes && blocks.length) {
     const protectedSlice = blocks.slice(protectedStart)
     const origProtectedTexts = protectedSlice.map((b) => b.text)
@@ -1103,6 +1105,7 @@ export function openaiToSncsRequest(body, opts = {}) {
       text = composeText(sysText, toolsText, blocks)
       over = measure(text) - stage4MaxBytes
     }
+    textWithAttachmentNote = composeText(sysText, toolsText, blocks, OVERFLOW_ATTACHMENT_NOTE)
   }
 
   return {
@@ -1115,6 +1118,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     convoHashes,
     imageUrls: collectImageUrls(outboundMsgs),
     overflowUserText,
+    textWithAttachmentNote,
     stream: body?.stream === true,
     outpostId,
     workingSessionId,
@@ -1560,13 +1564,8 @@ async function runSncsTurn(a, openaiBody, ctx) {
   const attachments = await prepareTurnAttachments(a, reqPlan, opts)
   if (attachments.length) {
     reqPlan.userMessagePayload.attachments = attachments
-    if (reqPlan.overflowUserText && attachments.some((att) => att?.name === "prompt_context.txt")) {
-      const curText = String(reqPlan.userMessagePayload.text || "")
-      const directiveIdx = curText.lastIndexOf("<client_tool_directive>")
-      reqPlan.userMessagePayload.text =
-        directiveIdx > 0
-          ? `${curText.slice(0, directiveIdx).trimEnd()}\n\n${OVERFLOW_ATTACHMENT_NOTE}\n\n${curText.slice(directiveIdx)}`
-          : `${curText}\n\n${OVERFLOW_ATTACHMENT_NOTE}`
+    if (reqPlan.textWithAttachmentNote && attachments.some((att) => att?.name === "prompt_context.txt")) {
+      reqPlan.userMessagePayload.text = reqPlan.textWithAttachmentNote
     }
   }
 

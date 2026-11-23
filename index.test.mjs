@@ -1601,6 +1601,50 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
   assert.equal(failFrame.payload.attachments, undefined)
   assert.ok(!failFrame.payload.text.includes("prompt_context.txt"), "must NOT mention prompt_context.txt when upload fails")
   assert.match(failFrame.payload.text, /smaller line range/i)
+
+  // 3. Tool-less overflow whose body literally contains "<client_tool_directive>" (e.g. reading bridge.mjs)
+  // must place the attachment note strictly AFTER the body, NEVER spliced into the middle of the text
+  const sourceCodeWithLiteral =
+    'const tag = "<client_tool_directive>"\n' + "X".repeat(65_000) + "\nconst endMarker = 'EOF'"
+  const literalFrames = []
+  const LiteralWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") literalFrames.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+  await executeSncsChat(
+    acct,
+    { model: "balanced", stream: false, messages: [{ role: "user", content: sourceCodeWithLiteral }] },
+    {
+      WebSocket: LiteralWS,
+      stateful: false,
+      uploadAttachment: async (_a, file) => ({
+        type: "file",
+        name: file.name,
+        size: file.bytes.byteLength,
+        mimeType: file.mimeType,
+        path: `/workspace/attached_files/${file.name}`,
+        attachmentId: "att-lit-1",
+        contentSha256: "sha-lit",
+      }),
+    },
+  )
+  assert.equal(literalFrames.length, 1)
+  const litText = literalFrames[0].text
+  assert.ok(litText.includes('const tag = "<client_tool_directive>"'), "source literal must remain untouched")
+  assert.ok(
+    litText.indexOf("const endMarker = 'EOF'") < litText.indexOf("attached as prompt_context.txt"),
+    "attachment note must be placed strictly after body, not spliced at literal <client_tool_directive>",
+  )
 })
 
 test("resumed thread sends incremental <tools_update> when toolset changes across turns and compacts large tool deltas", async () => {
