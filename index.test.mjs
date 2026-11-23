@@ -969,7 +969,7 @@ test("stateful thread_id incremental continuation reuses threads, isolates accou
   const dynMsg = sentFrames[5].find((f) => f.type === "user_message").payload
   assert.equal(dynMsg.thread_id, retryMsg.thread_id)
   assert.ok(!dynMsg.text.includes("SYSTEM_PROMPT_V1"))
-  assert.ok(dynMsg.text.includes("<system_context_update>\nOpen file: app.py (line 42)\n</system_context_update>"))
+  assert.ok(dynMsg.text.includes("<system_context_update>\n+Open file: app.py (line 42)\n</system_context_update>"))
 })
 
 test("_chunked_frame reassembly, WebSocket connect/idle timeouts, uploadQuickAttachment, and image attachments work cleanly", async () => {
@@ -1207,7 +1207,7 @@ test("idleTimeoutMs, overflowUserText upload, fetchQuickSettings cache, and brow
     { WebSocket: OverflowWS, uploadAttachment: mockUpload, stateful: false },
   )
   assert.equal((await overRes.json()).choices[0].message.content, "Read overflow file")
-  assert.equal(uploadedName, "prompt_context.txt")
+  assert.match(uploadedName, /^prompt_context_[a-z0-9]+\.txt$/i)
   assert.equal(uploadedMime, "text/plain")
   assert.equal(sentUserPayloads[0].attachments.length, 1)
   assert.equal(sentUserPayloads[0].attachments[0].attachmentId, "att-big-1")
@@ -1589,17 +1589,20 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
     contentSha256: "sha-ok",
   }))
   assert.ok(okFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES, `final frame with attachment + note must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${okFrame.bytes}`)
-  assert.equal(okFrame.payload.attachments?.[0]?.name, "prompt_context.txt")
-  assert.match(okFrame.payload.text, /attached as prompt_context\.txt/)
+  assert.match(okFrame.payload.attachments?.[0]?.name || "", /^tool_results_[a-z0-9]+\.txt$/i)
+  assert.match(okFrame.payload.text, /attached in your Quick workspace at \/workspace\/attached_files\/tool_results_[a-z0-9]+\.txt/i)
+  assert.match(okFrame.payload.text, /full content in attached file tool_results_[a-z0-9]+\.txt lines \d+-\d+/i)
+  assert.ok(!okFrame.payload.text.includes("smaller line range"), "when attachment uploaded, must not contradict it with re-read hint")
+  assert.match(okFrame.payload.text, /built-in workspace file reader/i)
   assert.ok(okFrame.payload.text.endsWith("</client_tool_directive>"), "note must be inserted before trailing <client_tool_directive>")
 
-  // 2. Upload fails -> no attachment and NO misleading prompt_context.txt claim in text
+  // 2. Upload fails -> no attachment and NO misleading attachment claim in text
   const failFrame = await runWithUploader(async () => {
     throw new Error("DLP upload failed")
   })
   assert.ok(failFrame.bytes <= MAX_USER_MESSAGE_FRAME_BYTES)
   assert.equal(failFrame.payload.attachments, undefined)
-  assert.ok(!failFrame.payload.text.includes("prompt_context.txt"), "must NOT mention prompt_context.txt when upload fails")
+  assert.ok(!failFrame.payload.text.includes("attached_files/"), "must NOT mention attached file when upload fails")
   assert.match(failFrame.payload.text, /smaller line range/i)
 
   // 3. Tool-less overflow whose body literally contains "<client_tool_directive>" (e.g. reading bridge.mjs)
@@ -1642,7 +1645,7 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
   const litText = literalFrames[0].text
   assert.ok(litText.includes('const tag = "<client_tool_directive>"'), "source literal must remain untouched")
   assert.ok(
-    litText.indexOf("const endMarker = 'EOF'") < litText.indexOf("attached as prompt_context.txt"),
+    litText.indexOf("const endMarker = 'EOF'") < litText.indexOf("attached in your Quick workspace"),
     "attachment note must be placed strictly after body, not spliced at literal <client_tool_directive>",
   )
 })
@@ -2091,4 +2094,122 @@ test("CJK language detection strips <context>/code blocks and persists across re
     /4\. Language Consistency:[\s\S]*Chinese/,
     "resumed English-only tool_result turn must preserve cached Chinese language consistency rule",
   )
+})
+
+test("line-boundary truncation, dropped-history marker + attachment, frame budget hint, and -old/+new systemDeltaText work", async () => {
+  const readTool = {
+    type: "function",
+    function: { name: "read_file", description: "Read file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+  }
+
+  // 1. Line-boundary truncation does not split mid-token like `${a?.` and attachment line ranges match exact content
+  const codeLines = Array.from({ length: 1200 }, (_, i) => `const line_${String(i + 1).padStart(4, "0")} = \`val_\${a?.b?.c_${i}}\``).join("\n")
+  const req = openaiToSncsRequest({
+    model: "balanced",
+    tools: [readTool],
+    messages: [
+      { role: "user", content: "Old Q1 " + "H".repeat(25_000) },
+      { role: "assistant", content: "Old A1 " + "K".repeat(25_000) },
+      { role: "user", content: "Read file" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "lb1", type: "function", function: { name: "read_file", arguments: '{"path":"big.mjs"}' } }],
+      },
+      { role: "tool", tool_call_id: "lb1", name: "read_file", content: codeLines },
+    ],
+  })
+
+  // Frame budget hint present in tool protocol
+  assert.match(req.userMessagePayload.text, /~55 KB[\s\S]*~250 lines/)
+  // Stage 2 omitted marker present AND dropped earlier history spilled into overflowUserText on new thread
+  assert.match(req.userMessagePayload.text, /\[Earlier \d+ conversation message\(s\) omitted to fit 64KB frame\]/)
+  assert.ok(req.overflowUserText.includes("=== DROPPED EARLIER HISTORY"), "dropped history should be preserved in overflow attachment on new thread")
+  assert.ok(req.overflowUserText.includes("Old Q1 "), "untruncated dropped history must be in overflow attachment")
+  assert.ok(req.overflowUserText.includes("=== TOOL RESULT #1"), "overflow attachment must have structured section headers")
+
+  // Verify line-boundary snap: text immediately before `...[trimmed` ends with a newline, and text immediately after `]...` starts with a full line
+  const trimMatch = req.textWithAttachmentNote.match(/([^\n]*)\n\.\.\.\[trimmed \d+ of \d+ chars; full content in attached file (tool_results_[a-z0-9]+\.txt) lines (\d+)-(\d+)\]\.\.\.\n([^\n]*)/i)
+  assert.ok(trimMatch, "with-attachment text must include exact attachment filename and line range")
+  assert.match(trimMatch[1], /^const line_\d{4} = `val_\$\{a\?\.b\?\.c_\d+\}`$/, "head cut must land cleanly on a full line boundary")
+  assert.match(trimMatch[5], /^const line_\d{4} = `val_\$\{a\?\.b\?\.c_\d+\}`$/, "tail cut must land cleanly on a full line boundary")
+  const attachLines = req.overflowUserText.split("\n")
+  const startLine = Number(trimMatch[3])
+  const endLine = Number(trimMatch[4])
+  assert.ok(attachLines[startLine - 1].startsWith('<tool_result id="lb1"'), `line ${startLine} should start tool_result`)
+  assert.equal(attachLines[endLine - 1], "</tool_result>", `line ${endLine} should close tool_result`)
+
+  // 2. systemDeltaText: -old / +new diff format AND fresh thread fallback when prevSys="" and nextSys > 20k chars
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-sys", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "sys-acct" }
+  const sent = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "ok" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  // Turn 1 with rule A
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "system", content: "Header\nRule: Always use tabs\nFooter" },
+        { role: "user", content: "Hi" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sys-diff-1" },
+  )
+  // Turn 2 replaces rule A with rule B -> <system_context_update> shows BOTH -old and +new
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "system", content: "Header\nRule: Always use 2 spaces\nFooter" },
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Next" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sys-diff-1" },
+  )
+  assert.equal(sent[1].thread_id, sent[0].thread_id)
+  assert.ok(sent[1].text.includes("<system_context_update>\n-Rule: Always use tabs\n+Rule: Always use 2 spaces\n</system_context_update>"))
+
+  // Turn 1 with NO system prompt, then Turn 2 adds >20k system prompt -> must open fresh thread (NOT silently drop!)
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: "No sys initially" }] },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sys-big-2" },
+  )
+  const hugeSys = "IMPORTANT_RULE_START\n" + "S".repeat(22_000) + "\nIMPORTANT_RULE_END"
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "system", content: hugeSys },
+        { role: "user", content: "No sys initially" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Now follow huge system prompt" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sys-big-2" },
+  )
+  assert.notEqual(sent[3].thread_id, sent[2].thread_id, "must open fresh thread when >20k system prompt appears from empty prevSys")
+  assert.ok(sent[3].text.includes("IMPORTANT_RULE_START"), "new thread must include full <instructions> with new system prompt")
 })
