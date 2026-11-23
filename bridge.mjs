@@ -295,149 +295,15 @@ async function resolveImageBytes(urlStr, fetchImpl, signal) {
   return null
 }
 
-export const MAX_USER_MESSAGE_FRAME_BYTES = 62_000
-const OVERFLOW_ATTACHMENT_RESERVE_BYTES = 800
+export const MAX_USER_MESSAGE_FRAME_BYTES = 58_000
 
-function buildOverflowAttachmentNote(attachmentName, droppedRange = null) {
-  const droppedPart = droppedRange
-    ? ` Omitted earlier history is in lines ${droppedRange.startLine}-${droppedRange.endLine}.`
-    : ""
-  return `[Note: Full untruncated content is attached in your Quick workspace at /workspace/attached_files/${attachmentName}.${droppedPart} Exception to the no-container-tools rule: use your built-in workspace file reader to read this attachment directly instead of re-reading those lines via local <tool_call>.]`
-}
-
-function snapHeadToLineBoundary(s, targetHead) {
-  if (targetHead <= 0 || targetHead >= s.length) return targetHead
-  const minHead = Math.max(16, targetHead - Math.min(240, Math.floor(targetHead * 0.25)))
-  const nl = s.lastIndexOf("\n", targetHead)
-  if (nl >= minHead) return nl
-  return targetHead
-}
-
-function snapTailToLineBoundary(s, targetTailStart) {
-  if (targetTailStart <= 0 || targetTailStart >= s.length) return targetTailStart
-  const maxTailStart = Math.min(
-    s.length - 16,
-    targetTailStart + Math.min(240, Math.floor((s.length - targetTailStart) * 0.25)),
-  )
-  const nl = s.indexOf("\n", targetTailStart)
-  if (nl !== -1 && nl + 1 <= maxTailStart) return nl + 1
-  return targetTailStart
-}
-
-function truncateMiddle(str, maxChars, optsOrMarker = undefined) {
+function truncateMiddle(str, maxChars, marker = "\n...[trimmed to fit frame limit]...\n") {
   const s = String(str ?? "")
   if (s.length <= maxChars) return s
-  const opts = typeof optsOrMarker === "string" ? { marker: optsOrMarker } : optsOrMarker || {}
-  const makeMarker = (omitted) => {
-    if (opts.marker) return opts.marker
-    if (opts.attachmentRef) {
-      return `\n...[trimmed ${omitted} of ${s.length} chars; full content in attached file ${opts.attachmentRef.name} lines ${opts.attachmentRef.startLine}-${opts.attachmentRef.endLine}]...\n`
-    }
-    const base = `trimmed ${omitted} of ${s.length} chars to fit 64KB frame`
-    const hints = []
-    if (opts.isToolResult) hints.push("re-read with a smaller line range if exact omitted lines are needed")
-    return `\n...[${base}${hints.length ? `; ${hints.join("; ")}` : ""}]...\n`
-  }
-  let marker = makeMarker(Math.max(1, s.length - maxChars))
-  if (maxChars <= marker.length + 16) {
-    marker = `\n...[trimmed ${Math.max(1, s.length - maxChars)}/${s.length} chars]...\n`
-  }
-  if (maxChars <= marker.length + 16) {
-    return s.slice(0, Math.max(0, maxChars))
-  }
-  const kept = maxChars - marker.length
-  const headTarget = Math.floor(kept * 0.65)
-  const tailTarget = kept - headTarget
-  let headEnd = snapHeadToLineBoundary(s, headTarget)
-  let tailStart = snapTailToLineBoundary(s, s.length - tailTarget)
-  if (headEnd >= tailStart) {
-    headEnd = headTarget
-    tailStart = s.length - tailTarget
-  }
-  const omitted = Math.max(1, tailStart - headEnd)
-  const exactMarker = opts.marker ? marker : makeMarker(omitted)
-  if (headEnd + exactMarker.length + (s.length - tailStart) <= maxChars) {
-    marker = exactMarker
-  }
-  return s.slice(0, headEnd) + marker + s.slice(tailStart)
-}
-
-function describeBlockForHeader(block, index) {
-  const txt = String(block?.text || "")
-  const m = txt.match(/^<tool_result\b([^>]*)>/i)
-  if (m) return `TOOL RESULT #${index + 1} (${m[1].trim()})`
-  if (block?.role === "assistant") return `ASSISTANT #${index + 1}`
-  if (block?.role === "user") return `USER #${index + 1}`
-  return `SECTION #${index + 1}`
-}
-
-function buildOverflowDocument(droppedBlocks, protectedBlocks, attachmentName) {
-  const lines = []
-  let droppedRange = null
-  if (droppedBlocks.length) {
-    lines.push(`=== DROPPED EARLIER HISTORY (${droppedBlocks.length} message(s)) ===`)
-    const startLine = lines.length + 1
-    for (let i = 0; i < droppedBlocks.length; i++) {
-      const b = droppedBlocks[i]
-      if (!b?.text) continue
-      if (i > 0) lines.push("")
-      lines.push(...String(b.text).split("\n"))
-    }
-    const endLine = lines.length
-    droppedRange = { name: attachmentName, startLine, endLine }
-  }
-  const protectedRanges = []
-  for (let i = 0; i < protectedBlocks.length; i++) {
-    const b = protectedBlocks[i]
-    const raw = String(b?.text || "")
-    if (!raw) {
-      protectedRanges.push(null)
-      continue
-    }
-    if (lines.length) lines.push("")
-    lines.push(`=== ${describeBlockForHeader(b, i)} ===`)
-    const startLine = lines.length + 1
-    lines.push(...raw.split("\n"))
-    const endLine = lines.length
-    protectedRanges.push({ name: attachmentName, startLine, endLine })
-  }
-  return {
-    text: lines.join("\n"),
-    droppedRange,
-    protectedRanges,
-  }
-}
-
-function jsonContentBytes(str) {
-  return Buffer.byteLength(JSON.stringify(String(str ?? "")), "utf8") - 2
-}
-
-function allocateProportionalBudgets(lengths, totalBudget) {
-  const n = lengths.length
-  if (n === 0) return []
-  const totalLen = lengths.reduce((a, b) => a + b, 0)
-  if (totalLen <= totalBudget) return [...lengths]
-  const minFloor = Math.min(256, Math.floor(totalBudget / n))
-  const budgets = new Array(n).fill(0)
-  let remainingBudget = totalBudget
-  let remainingLargeLen = 0
-  const largeIndices = []
-  for (let i = 0; i < n; i++) {
-    if (lengths[i] <= minFloor) {
-      budgets[i] = lengths[i]
-      remainingBudget -= lengths[i]
-    } else {
-      largeIndices.push(i)
-      remainingLargeLen += lengths[i]
-    }
-  }
-  const reserve = minFloor * largeIndices.length
-  const extra = Math.max(0, remainingBudget - reserve)
-  for (const idx of largeIndices) {
-    const share = remainingLargeLen > 0 ? Math.floor((extra * lengths[idx]) / remainingLargeLen) : 0
-    budgets[idx] = Math.min(lengths[idx], minFloor + share)
-  }
-  return budgets
+  if (maxChars <= marker.length + 16) return s.slice(0, Math.max(0, maxChars))
+  const head = Math.floor((maxChars - marker.length) * 0.65)
+  const tail = maxChars - marker.length - head
+  return s.slice(0, head) + marker + s.slice(s.length - tail)
 }
 
 function summarizeSchema(schema, depth = 0) {
@@ -466,9 +332,9 @@ function summarizeSchema(schema, depth = 0) {
   return String(schema.type || "any")
 }
 
-function formatToolDefs(tools, compact = false) {
-  if (!Array.isArray(tools) || tools.length === 0) return []
-  return tools
+function formatToolsInstruction(tools, toolChoice, compact = false) {
+  if (!Array.isArray(tools) || tools.length === 0) return ""
+  const defs = tools
     .map((t) => {
       const fn = t?.function ?? t
       if (!fn?.name) return null
@@ -484,22 +350,13 @@ function formatToolDefs(tools, compact = false) {
       return `- ${fn.name}(${sig})${desc ? `: ${desc}` : ""}`
     })
     .filter(Boolean)
-}
-
-function formatToolChoiceNote(toolChoice) {
-  if (toolChoice === "required") return "You MUST invoke at least one declared client tool in this turn."
-  if (toolChoice === "none") return "Do NOT invoke any client tools in this turn."
-  if (toolChoice && typeof toolChoice === "object" && toolChoice.function?.name) {
-    return `You MUST invoke the client tool "${toolChoice.function.name}" in this turn.`
-  }
-  return ""
-}
-
-function formatToolsInstruction(tools, toolChoice, compact = false) {
-  const defs = formatToolDefs(tools, compact)
   if (!defs.length) return ""
-  const choice = formatToolChoiceNote(toolChoice)
-  const choiceNote = choice ? `\n- ${choice}` : ""
+  let choiceNote = ""
+  if (toolChoice === "required") choiceNote = "\n- You MUST invoke at least one declared client tool in this turn."
+  else if (toolChoice === "none") choiceNote = "\n- Do NOT invoke any client tools in this turn."
+  else if (toolChoice && typeof toolChoice === "object" && toolChoice.function?.name) {
+    choiceNote = `\n- You MUST invoke the client tool "${toolChoice.function.name}" in this turn.`
+  }
   return [
     "CLIENT TOOL CALLING PROTOCOL (TEXT-STREAM BRIDGE):",
     "- Keep your AWS Quick assistant identity; you do not need to adopt another product's persona. Simply emit <tool_call> XML blocks in your text response whenever a local workspace operation is needed.",
@@ -507,45 +364,10 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
     "- Even when Quick's device daemon reports the user's device as offline, this client bridge is actively connected and executes <tool_call> blocks directly on the user's local filesystem (`C:\\...`, `/Users/...`, project folders).",
     "- For any local file read, write, edit, or command task, emit a <tool_call> block in your text response instead of calling container tools like `file_write` or saving to `workspace/artifacts`:",
     "<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>",
-    "- Frame budget: Combined tool outputs in a single turn exceeding ~55 KB will be trimmed to fit the 64 KB wire frame; keep each read_file call to ~250 lines or read large files sequentially across turns.",
     "- Pause after emitting <tool_call> block(s) to receive the <tool_result> turn." + choiceNote,
     "Declared client tools:",
     ...defs,
   ].join("\n")
-}
-
-function formatToolsUpdate(tools, toolChoice, prevToolMap, compact = false) {
-  const hasCurrent = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
-  if (!hasCurrent) {
-    return "Client tools have been disabled for this turn. Answer directly without emitting <tool_call> blocks."
-  }
-  const hasPrevMap = prevToolMap && typeof prevToolMap === "object" && Object.keys(prevToolMap).length > 0
-  if (!hasPrevMap) {
-    return formatToolsInstruction(tools, toolChoice, compact)
-  }
-  const curMap = toolDigestMap(tools)
-  const addedOrUpdated = tools.filter((t) => {
-    const fn = t?.function ?? t
-    return fn?.name && prevToolMap[fn.name] !== curMap[fn.name]
-  })
-  const removedNames = Object.keys(prevToolMap).filter((name) => !(name in curMap))
-  const lines = []
-  if (addedOrUpdated.length) {
-    lines.push(
-      'Added or updated client tools (invoke with <tool_call>{"name":"tool_name","arguments":{}}</tool_call>):',
-      ...formatToolDefs(addedOrUpdated, compact),
-    )
-  }
-  if (removedNames.length) {
-    lines.push(`Removed client tools (no longer available): ${removedNames.join(", ")}.`)
-  }
-  const choice = formatToolChoiceNote(toolChoice)
-  if (choice) {
-    lines.push(choice)
-  } else if (!lines.length) {
-    lines.push("Tool choice policy updated to auto; invoke any declared client tool as needed.")
-  }
-  return lines.join("\n")
 }
 
 export function normalizeClientSystemText(sysText) {
@@ -573,23 +395,13 @@ const KANA_RE = /[\u3040-\u30ff]/
 const HANGUL_RE = /[\uac00-\ud7af]/
 const LATIN_LETTER_RE = /[A-Za-z]/g
 
-function stripNonProseForLangDetect(text) {
-  return String(text ?? "")
-    .replace(/<context\b[^>]*>[\s\S]*?<\/context>/gi, " ")
-    .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/gi, " ")
-    .replace(/<ide_[a-z_]+\b[^>]*>[\s\S]*?<\/ide_[a-z_]+>/gi, " ")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`[^`\n]*`/g, " ")
-}
-
 function detectConversationLanguage(opts = {}, messages = []) {
   const localeTag = String(opts.locale || "").toLowerCase().split(/[-_]/)[0]
   if (CJK_LANGUAGES[localeTag]) return localeTag
-  // Many users run an en-US OS locale while chatting in Chinese, so also read recent user prose
-  // after stripping IDE <context> blocks and fenced/inline code.
+  // Many users run an en-US OS locale while chatting in Chinese, so also read the recent turns.
   const text = messages
     .slice(-4)
-    .map((m) => stripNonProseForLangDetect(textFromContent(m?.content)))
+    .map((m) => textFromContent(m?.content))
     .join("\n")
   const cjk = (text.match(CJK_TEXT_RE) || []).length
   const latin = (text.match(LATIN_LETTER_RE) || []).length
@@ -677,17 +489,6 @@ function messageDigest(msg) {
   return sha256Hex(JSON.stringify([role, text, calls, callId]))
 }
 
-function toolDigestMap(tools) {
-  const out = {}
-  if (!Array.isArray(tools)) return out
-  for (const t of tools) {
-    const fn = t?.function ?? t
-    if (!fn?.name) continue
-    out[fn.name] = sha256Hex(JSON.stringify([fn.name, fn.description || "", canonicalJson(fn.parameters ?? {})]))
-  }
-  return out
-}
-
 function toolsDigest(tools, toolChoice) {
   const toolSig = (Array.isArray(tools) ? tools : [])
     .map((t) => {
@@ -711,35 +512,17 @@ function systemDeltaText(prevSys, nextSys, maxDiffChars = 20000) {
     endA--
     endB--
   }
-  const removed = endA >= start ? a.slice(start, endA + 1) : []
-  const added = endB >= start ? b.slice(start, endB + 1) : []
-  if (!removed.length && !added.length) return ""
-  const diffLines = [...removed.map((line) => `-${line}`), ...added.map((line) => `+${line}`)]
-  const diffText = diffLines.join("\n").trim()
-  if (!diffText) return ""
-  return diffText.length <= maxDiffChars ? diffText : truncateMiddle(diffText, maxDiffChars)
-}
-
-function escapeXmlAttr(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-}
-
-function escapeToolResultBody(text) {
-  return String(text ?? "").replace(/<\/tool_result/gi, "<\\/tool_result")
+  const changed = b.slice(start, endB + 1).join("\n").trim()
+  if (!changed) return ""
+  return changed.length <= maxDiffChars ? changed : truncateMiddle(changed, maxDiffChars)
 }
 
 function formatConvoBlocks(msgs) {
-  if (msgs.length === 1 && String(msgs[0]?.role || "user").toLowerCase() === "user" && !msgs[0]?.tool_calls?.length) {
-    return [{ text: textFromContent(msgs[0].content), msgIndex: 0, role: "user" }]
+  if (msgs.length === 1 && String(msgs[0].role).toLowerCase() === "user" && !msgs[0].tool_calls?.length) {
+    return [textFromContent(msgs[0].content)]
   }
   const blocks = []
-  for (let idx = 0; idx < msgs.length; idx++) {
-    const msg = msgs[idx]
-    if (!msg || typeof msg !== "object") continue
+  for (const msg of msgs) {
     const role = String(msg.role || "user").toLowerCase()
     if (role === "assistant") {
       let content = textFromContent(msg.content)
@@ -756,178 +539,78 @@ function formatConvoBlocks(msgs) {
           .join("\n")
         content = content ? `${content}\n${calls}` : calls
       }
-      blocks.push({ text: `Assistant:\n${content}`, msgIndex: idx, role: "assistant" })
+      blocks.push(`Assistant:\n${content}`)
     } else if (role === "tool") {
-      const callId = escapeXmlAttr(msg.tool_call_id || msg.name || "tool")
-      const nameAttr = msg.name ? ` name="${escapeXmlAttr(msg.name)}"` : ""
-      const safeBody = escapeToolResultBody(textFromContent(msg.content))
-      blocks.push({
-        text: `<tool_result id="${callId}"${nameAttr}>\n${safeBody}\n</tool_result>`,
-        msgIndex: idx,
-        role: "tool",
-      })
+      const callId = msg.tool_call_id || msg.name || "tool"
+      const nameAttr = msg.name ? ` name="${msg.name}"` : ""
+      blocks.push(`<tool_result id="${callId}"${nameAttr}>\n${textFromContent(msg.content)}\n</tool_result>`)
     } else {
-      blocks.push({ text: `User:\n${textFromContent(msg.content)}`, msgIndex: idx, role: "user" })
+      blocks.push(`User:\n${textFromContent(msg.content)}`)
     }
   }
-  return blocks.length ? blocks : [{ text: "Hello", msgIndex: 0, role: "user" }]
+  return blocks.length ? blocks : ["Hello"]
 }
 
 /**
  * In-memory bounded thread cache mapping conversation prefixes & session IDs to Amazon Quick `threadId`s.
  */
 export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS) {
-  // Thread-level LRU (`threads`: threadId -> record) with O(1) secondary index Maps so a single
-  // thread with many parallel tool_call_ids still counts as 1 LRU entry instead of evicting others.
-  const threads = new Map()
-  const bySession = new Map()
-  const byHead = new Map()
-  const byUser0 = new Map()
-  const byToolCall = new Map()
-  const inflight = new Map()
-
-  const entryHasTools = (entry) =>
-    Boolean(entry?.hasTools || (entry?.toolMap && Object.keys(entry.toolMap).length > 0))
-
-  const removeIndexes = (record) => {
-    if (!record) return
-    const tid = record.threadId
-    if (record._sessionKey && bySession.get(record._sessionKey) === tid) bySession.delete(record._sessionKey)
-    if (record._headKey && byHead.get(record._headKey) === tid) byHead.delete(record._headKey)
-    if (record._user0Key && byUser0.get(record._user0Key) === tid) byUser0.delete(record._user0Key)
-    if (Array.isArray(record._tcKeys)) {
-      for (const k of record._tcKeys) {
-        if (byToolCall.get(k) === tid) byToolCall.delete(k)
-      }
-    }
-  }
-
-  const deleteThread = (threadId) => {
-    if (!threadId) return
-    const record = threads.get(threadId)
-    if (!record) return
-    threads.delete(threadId)
-    removeIndexes(record)
-  }
+  const byKey = new Map()
 
   const prune = (now) => {
-    for (const [tid, rec] of threads) {
-      if (now - rec.updatedAt > ttlMs) deleteThread(tid)
+    for (const [k, v] of byKey) {
+      if (now - v.updatedAt > ttlMs) byKey.delete(k)
     }
-    while (threads.size > maxEntries) {
-      const oldest = threads.keys().next()
+    while (byKey.size > maxEntries) {
+      const oldest = byKey.keys().next()
       if (oldest.done) break
-      deleteThread(oldest.value)
+      byKey.delete(oldest.value)
     }
   }
 
-  const touchThread = (threadId) => {
-    if (!threadId) return null
-    const rec = threads.get(threadId)
-    if (!rec) return null
-    if (Date.now() - rec.updatedAt > ttlMs) {
-      deleteThread(threadId)
+  const touch = (k) => {
+    const v = byKey.get(k)
+    if (!v) return null
+    if (Date.now() - v.updatedAt > ttlMs) {
+      byKey.delete(k)
       return null
     }
-    threads.delete(threadId)
-    threads.set(threadId, rec)
-    return rec
-  }
-
-  const assistantMatchesEntry = (entry, msg, msgHash) => {
-    if (entry.expectedAssistantCallsSig) {
-      const actualCallsSig = canonicalJson(normalizeToolCallsForDigest(msg?.tool_calls))
-      return actualCallsSig === entry.expectedAssistantCallsSig
-    }
-    if (entry.expectedAssistantTextSig || entry.expectedAssistantSig) {
-      const hasCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
-      if (hasCalls) return false
-      if (entry.expectedAssistantSig && msgHash === entry.expectedAssistantSig) return true
-      if (entry.expectedAssistantTextSig) {
-        return sha256Hex(textFromContent(msg?.content).trim()) === entry.expectedAssistantTextSig
-      }
-      return false
-    }
-    return true
+    byKey.delete(k)
+    byKey.set(k, v)
+    return v
   }
 
   return {
-    get size() {
-      return threads.size
-    },
-    getInflight(threadId) {
-      return threadId ? inflight.get(threadId) || null : null
-    },
-    acquire(threadId) {
-      if (!threadId) return () => {}
-      let done = false
-      let resolveDone
-      const promise = new Promise((resolve) => {
-        resolveDone = resolve
-      })
-      inflight.set(threadId, promise)
-      return () => {
-        if (done) return
-        done = true
-        if (inflight.get(threadId) === promise) inflight.delete(threadId)
-        resolveDone()
-      }
-    },
-    hasToolThread(accountKey, sessionId, convoMessages) {
-      if (sessionId) {
-        const s = touchThread(bySession.get(`${accountKey}|${sessionId}`))
-        if (s && s.accountKey === accountKey && entryHasTools(s)) return true
-      }
-      if (Array.isArray(convoMessages) && convoMessages.length) {
-        const firstHash = messageDigest(convoMessages[0])
-        const u = touchThread(byUser0.get(`${accountKey}|${firstHash}`))
-        if (u && u.accountKey === accountKey && entryHasTools(u)) return true
-        for (let i = convoMessages.length - 1; i >= 0; i--) {
-          const m = convoMessages[i]
-          if (String(m?.role || "").toLowerCase() !== "tool") continue
-          const tcId = String(m?.tool_call_id || "")
-          if (!tcId) continue
-          const t = touchThread(byToolCall.get(`${accountKey}|${tcId}`))
-          if (t && t.accountKey === accountKey && entryHasTools(t)) return true
-        }
-      }
-      return false
-    },
-    lookup(accountKey, sessionId, toolsSig, nextSysText, convoMessages, lookupOpts = {}) {
+    lookup(accountKey, sessionId, toolsSig, nextSysText, convoMessages) {
       if (!Array.isArray(convoMessages) || convoMessages.length < 2) return null
-      const reqHasTools = typeof lookupOpts === "boolean" ? lookupOpts : lookupOpts?.hasTools !== false
       const hashes = convoMessages.map(messageDigest)
       const roleOf = (m) => String(m?.role || "").toLowerCase()
 
-      // 1. High-priority match by active tool_call_id in contiguous trailing tool results.
-      // Stop immediately on any non-tool message (e.g. a trailing `user` title-generation prompt)
-      // and never attach a tool-less request onto a tool-bearing thread.
-      if (reqHasTools) {
-        for (let i = convoMessages.length - 1; i >= 1; i--) {
-          const r = roleOf(convoMessages[i])
-          if (r !== "tool") break
+      // 1. High-priority match by active tool_call_id in trailing tool results (immune to IDE assistant/user reformatting)
+      let trailingAssistantSeen = false
+      for (let i = convoMessages.length - 1; i >= 1; i--) {
+        const r = roleOf(convoMessages[i])
+        if (r === "assistant") {
+          trailingAssistantSeen = true
+          break
+        }
+        if (r === "tool" && !trailingAssistantSeen) {
           const tcId = String(convoMessages[i]?.tool_call_id || "")
           if (!tcId) continue
-          const tcKey = `${accountKey}|${tcId}`
-          const entry = touchThread(byToolCall.get(tcKey))
+          const tcKey = `tc:${accountKey}|${tcId}`
+          const entry = touch(tcKey)
           if (!entry || entry.accountKey !== accountKey) continue
-          if (!reqHasTools && entryHasTools(entry)) continue
           let deltaStart = i
           while (deltaStart > 0 && roleOf(convoMessages[deltaStart - 1]) === "tool") {
             deltaStart--
           }
           const systemUpdate = systemDeltaText(entry.sysText || "", nextSysText || "")
-          if (systemUpdate === null) continue
-          const toolsChanged = entry.toolsSig !== toolsSig
           return {
-            key: `tc:${tcKey}`,
+            key: tcKey,
             threadId: entry.threadId,
             workingSessionId: entry.workingSessionId,
             deltaMessages: convoMessages.slice(deltaStart),
             systemUpdate,
-            toolsChanged,
-            prevToolMap: entry.toolMap || null,
-            lang: entry.lang || "",
             allHashes: hashes,
             toolsSig,
           }
@@ -936,23 +619,14 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
 
       // 2. Match by session ID, head (toolsSig + first user message), or first user message fallback
       const candidates = []
-      if (sessionId) {
-        const sk = `${accountKey}|${sessionId}`
-        candidates.push([`sess:${sk}`, bySession.get(sk)])
-      }
-      const hk = `${accountKey}|${toolsSig}|${hashes[0]}`
-      candidates.push([`head:${hk}`, byHead.get(hk)])
-      const uk = `${accountKey}|${hashes[0]}`
-      candidates.push([`user0:${uk}`, byUser0.get(uk)])
+      if (sessionId) candidates.push(`sess:${accountKey}|${sessionId}`)
+      candidates.push(`head:${accountKey}|${toolsSig}|${hashes[0]}`)
+      candidates.push(`user0:${accountKey}|${hashes[0]}`)
 
-      const seenTids = new Set()
-      for (const [label, tid] of candidates) {
-        if (!tid || seenTids.has(tid)) continue
-        seenTids.add(tid)
-        const entry = touchThread(tid)
+      for (const k of candidates) {
+        const entry = touch(k)
         if (!entry) continue
         if (entry.accountKey !== accountKey) continue
-        if (!reqHasTools && entryHasTools(entry)) continue
         const prefixLen = entry.msgHashes.length
         if (convoMessages.length < prefixLen + 2) continue
         let prefixOk = true
@@ -964,24 +638,18 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         }
         if (!prefixOk) continue
         if (roleOf(convoMessages[prefixLen]) !== "assistant") continue
-        if (!assistantMatchesEntry(entry, convoMessages[prefixLen], hashes[prefixLen])) continue
         let deltaStart = prefixLen + 1
         while (deltaStart < convoMessages.length && roleOf(convoMessages[deltaStart]) === "assistant") {
           deltaStart++
         }
         if (deltaStart >= convoMessages.length) continue
         const systemUpdate = systemDeltaText(entry.sysText || "", nextSysText || "")
-        if (systemUpdate === null) continue
-        const toolsChanged = entry.toolsSig !== toolsSig
         return {
-          key: label,
+          key: k,
           threadId: entry.threadId,
           workingSessionId: entry.workingSessionId,
           deltaMessages: convoMessages.slice(deltaStart),
           systemUpdate,
-          toolsChanged,
-          prevToolMap: entry.toolMap || null,
-          lang: entry.lang || "",
           allHashes: hashes,
           toolsSig,
         }
@@ -990,57 +658,48 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     },
     commit(accountKey, sessionId, state) {
       const now = Date.now()
-      const tid = state?.threadId
-      if (!tid) return
-      const prev = threads.get(tid)
-      if (prev) removeIndexes(prev)
-
-      const sessionKey = sessionId ? `${accountKey}|${sessionId}` : ""
-      const headKey = state?.msgHashes?.length ? `${accountKey}|${state.toolsSig}|${state.msgHashes[0]}` : ""
-      const user0Key = state?.msgHashes?.length ? `${accountKey}|${state.msgHashes[0]}` : ""
-      const tcKeys = Array.isArray(state?.toolCallIds)
-        ? state.toolCallIds.filter(Boolean).map((id) => `${accountKey}|${id}`)
-        : []
-
-      const record = {
-        ...state,
-        accountKey,
-        updatedAt: now,
-        _sessionKey: sessionKey,
-        _headKey: headKey,
-        _user0Key: user0Key,
-        _tcKeys: tcKeys,
+      const record = { ...state, accountKey, updatedAt: now }
+      // Remove stale tool_call_id bindings for this threadId before registering new ones
+      for (const [k, v] of byKey) {
+        if (k.startsWith(`tc:${accountKey}|`) && v.threadId === record.threadId) {
+          byKey.delete(k)
+        }
       }
-      threads.delete(tid)
-      threads.set(tid, record)
-      if (sessionKey) bySession.set(sessionKey, tid)
-      if (headKey) byHead.set(headKey, tid)
-      if (user0Key) byUser0.set(user0Key, tid)
-      for (const tk of tcKeys) byToolCall.set(tk, tid)
+      if (sessionId) {
+        const sk = `sess:${accountKey}|${sessionId}`
+        byKey.delete(sk)
+        byKey.set(sk, record)
+      }
+      if (record.msgHashes?.length) {
+        const hk = `head:${accountKey}|${record.toolsSig}|${record.msgHashes[0]}`
+        byKey.delete(hk)
+        byKey.set(hk, record)
+        const uk = `user0:${accountKey}|${record.msgHashes[0]}`
+        byKey.delete(uk)
+        byKey.set(uk, record)
+      }
+      if (Array.isArray(record.toolCallIds)) {
+        for (const id of record.toolCallIds) {
+          if (!id) continue
+          const tk = `tc:${accountKey}|${id}`
+          byKey.delete(tk)
+          byKey.set(tk, record)
+        }
+      }
       prune(now)
     },
     invalidate(accountKey, sessionId, threadId) {
-      if (threadId) {
-        const rec = threads.get(threadId)
-        if (rec && rec.accountKey === accountKey) deleteThread(threadId)
-      }
-      if (sessionId) {
-        const sk = `${accountKey}|${sessionId}`
-        const tid = bySession.get(sk)
-        if (tid) {
-          const rec = threads.get(tid)
-          if (rec && rec.accountKey === accountKey) deleteThread(tid)
-          else bySession.delete(sk)
+      for (const [k, v] of byKey) {
+        if (
+          (threadId && v.threadId === threadId && v.accountKey === accountKey) ||
+          (sessionId && k === `sess:${accountKey}|${sessionId}`)
+        ) {
+          byKey.delete(k)
         }
       }
     },
     clear() {
-      threads.clear()
-      bySession.clear()
-      byHead.clear()
-      byUser0.clear()
-      byToolCall.clear()
-      inflight.clear()
+      byKey.clear()
     },
   }
 }
@@ -1071,31 +730,16 @@ export function openaiToSncsRequest(body, opts = {}) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
   const toolChoice = body?.tool_choice
   const hasTools = tools.length > 0 && toolChoice !== "none"
-  const activeTools = hasTools ? tools : []
-  const toolsSig = toolsDigest(activeTools, toolChoice)
-  const toolMap = toolDigestMap(activeTools)
+  const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
   const rawSystemText = rawSystemParts.join("\n\n")
   const convoHashes = convoMessages.map(messageDigest)
 
   const resumeState = opts.resumeState || null
   const isResume = Boolean(resumeState?.threadId && Array.isArray(resumeState?.deltaMessages) && resumeState.deltaMessages.length)
-  const toolsChangedOnResume = isResume && Boolean(resumeState?.toolsChanged)
   const outboundMsgs = isResume ? resumeState.deltaMessages : convoMessages
   const hasToolResults = outboundMsgs.some((m) => String(m?.role || "").toLowerCase() === "tool")
-  const fullToolsPrompt = !isResume
-    ? hasTools
-      ? formatToolsInstruction(tools, toolChoice, false)
-      : ""
-    : toolsChangedOnResume
-      ? formatToolsUpdate(activeTools, toolChoice, resumeState?.prevToolMap, false)
-      : ""
-  const compactToolsPrompt = !isResume
-    ? hasTools
-      ? formatToolsInstruction(tools, toolChoice, true)
-      : ""
-    : toolsChangedOnResume
-      ? formatToolsUpdate(activeTools, toolChoice, resumeState?.prevToolMap, true)
-      : ""
+  const fullToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, false) : ""
+  const compactToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, true) : ""
   const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice, hasToolResults) : ""
 
   let convoBlocks = formatConvoBlocks(outboundMsgs)
@@ -1113,34 +757,21 @@ export function openaiToSncsRequest(body, opts = {}) {
   const surfaceType = surfaceTypeForPlatform(opts.platform)
   const maxFrameBytes = Number(opts.maxFrameBytes) > 0 ? Number(opts.maxFrameBytes) : MAX_USER_MESSAGE_FRAME_BYTES
 
-  const composeText = (sysText, toolsText, blockList, note = "") => {
+  const composeText = (sysText, toolsText, blocks) => {
     const instrParts = isResume ? [] : [sysText, toolsText].filter(Boolean)
-    const bodyText = blockList.map((b) => (typeof b === "string" ? b : b?.text || "")).filter(Boolean).join("\n\n")
+    const bodyText = blocks.filter(Boolean).join("\n\n")
     const parts = []
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
     if (isResume && resumeState.systemUpdate) {
       parts.push(`<system_context_update>\n${resumeState.systemUpdate}\n</system_context_update>`)
     }
-    if (isResume && toolsText) {
-      parts.push(`<tools_update>\n${toolsText}\n</tools_update>`)
-    }
     if (bodyText) parts.push(bodyText)
-    if (note) parts.push(note)
     if (trailing) parts.push(trailing)
     return parts.join("\n\n")
   }
 
-  const userMsgs = convoMessages.filter((m) => String(m?.role || "").toLowerCase() === "user")
-  const latestIsUser =
-    outboundMsgs.length > 0 && String(outboundMsgs[outboundMsgs.length - 1]?.role || "").toLowerCase() === "user"
-  const detectedLang = detectConversationLanguage(opts, userMsgs)
-  const lang =
-    resumeState?.lang && (!latestIsUser || !CJK_LANGUAGES[detectedLang])
-      ? resumeState.lang
-      : detectedLang
-
   const customPrompt = hasTools
-    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", lang)
+    ? buildBridgeCustomPrompt(tools, opts.customPrompt || "", detectConversationLanguage(opts, outboundMsgs))
     : opts.customPrompt || null
 
   const buildUserPayload = (textVal) => ({
@@ -1164,207 +795,56 @@ export function openaiToSncsRequest(body, opts = {}) {
 
   const measure = (textVal) => buildAidpInputFrame({ type: "user_message", payload: buildUserPayload(textVal) }).byteLength
 
-  const origSysText = isResume ? "" : normalizeClientSystemText(rawSystemParts.join("\n\n"))
-  let sysText = origSysText
-  let blocks = convoBlocks.map((b) => ({ ...b }))
+  let sysText = isResume ? "" : normalizeClientSystemText(rawSystemParts.join("\n\n"))
+  let blocks = [...convoBlocks]
   let toolsText = fullToolsPrompt
   let text = composeText(sysText, toolsText, blocks)
 
-  // Protected zone: everything in the current turn after the last assistant message
-  // (e.g., all parallel <tool_result> messages in the current round, or latest user turn).
-  let lastAssistantMsgIdx = -1
-  for (let i = outboundMsgs.length - 1; i >= 0; i--) {
-    if (String(outboundMsgs[i]?.role || "").toLowerCase() === "assistant") {
-      lastAssistantMsgIdx = i
-      break
-    }
-  }
-  let protectedStart = blocks.findIndex((b) => b.msgIndex > lastAssistantMsgIdx)
-  if (protectedStart < 0) protectedStart = Math.max(0, blocks.length - 1)
-
-  const shortMsgId = messageId.replace(/^msg-/, "").replace(/[^a-z0-9]/gi, "").slice(0, 12) || "turn"
-  const overflowAttachmentName = hasToolResults ? `tool_results_${shortMsgId}.txt` : `prompt_context_${shortMsgId}.txt`
-
-  // Stage 1: Compact verbose JSON tool schemas (initial or resumed <tools_update>) to concise typed signatures if over limit
-  let curBytes = measure(text)
-  if (curBytes > maxFrameBytes && compactToolsPrompt && toolsText !== compactToolsPrompt) {
+  // Stage 1: Compact verbose JSON tool schemas to concise typed signatures if over limit
+  if (!isResume && measure(text) > maxFrameBytes && hasTools) {
     toolsText = compactToolsPrompt
     text = composeText(sysText, toolsText, blocks)
-    curBytes = measure(text)
   }
 
-  // Stage 2: Trim/drop ONLY blocks before the protected zone using O(n) arithmetic byte estimates;
-  // preserve paired assistant tool_call block when shifting, leave an omitted-count marker,
-  // and keep full untruncated dropped history for new-thread overflow attachment.
-  const droppedBlocks = []
-  if (curBytes > maxFrameBytes && protectedStart > 0) {
-    const origBlocksByIndex = blocks.map((b) => ({ ...b }))
-    const blockJsonBytes = blocks.map((b) => jsonContentBytes(b.text))
-    let totalBlockJsonBytes = blockJsonBytes.reduce((a, b) => a + b, 0)
-    const emptyBodyFrameBytes = measure(composeText(sysText, toolsText, []))
-    const estimateFrameBytes = () =>
-      emptyBodyFrameBytes + Math.ceil(((totalBlockJsonBytes + Math.max(0, blocks.length - 1) * 4) * 4) / 3) + 16
-
-    for (let i = 0; i < protectedStart && estimateFrameBytes() > maxFrameBytes; i++) {
-      if (blocks[i].text.length > 800) {
-        const trimmed = truncateMiddle(blocks[i].text, 600, { isToolResult: blocks[i].role === "tool" })
-        const nextJsonLen = jsonContentBytes(trimmed)
-        totalBlockJsonBytes += nextJsonLen - blockJsonBytes[i]
-        blockJsonBytes[i] = nextJsonLen
-        blocks[i] = { ...blocks[i], text: trimmed }
+  // Stage 2: Trim older turns / long tool results first, preserving the latest turn & directives
+  if (measure(text) > maxFrameBytes && blocks.length > 1) {
+    for (let i = 0; i < blocks.length - 1 && measure(text) > maxFrameBytes; i++) {
+      if (blocks[i].length > 800) {
+        blocks[i] = truncateMiddle(blocks[i], 600)
+        text = composeText(sysText, toolsText, blocks)
       }
     }
-
-    const protectedHasTool = blocks.slice(protectedStart).some((b) => b.role === "tool")
-    let shiftLimit =
-      protectedHasTool && protectedStart > 0 && blocks[protectedStart - 1]?.role === "assistant"
-        ? protectedStart - 1
-        : protectedStart
-    let shiftedCount = 0
-    while (shiftLimit > 0 && estimateFrameBytes() > maxFrameBytes) {
+    while (blocks.length > 2 && measure(text) > maxFrameBytes) {
       blocks.shift()
-      totalBlockJsonBytes -= blockJsonBytes.shift()
-      droppedBlocks.push(origBlocksByIndex[shiftedCount])
-      shiftedCount++
-      protectedStart--
-      shiftLimit--
-    }
-
-    if (droppedBlocks.length > 0) {
-      const markerText = `[Earlier ${droppedBlocks.length} conversation message(s) omitted to fit 64KB frame]`
-      blocks.unshift({ text: markerText, msgIndex: -1, role: "system_note" })
-      protectedStart++
-    }
-
-    text = composeText(sysText, toolsText, blocks)
-    curBytes = measure(text)
-    // Verify once with exact measure(); if slightly over due to base64 rounding, drop remaining shiftable blocks
-    while (curBytes > maxFrameBytes && shiftLimit > 0) {
-      const dropAt = droppedBlocks.length > 0 ? 1 : 0
-      blocks.splice(dropAt, 1)
-      droppedBlocks.push(origBlocksByIndex[shiftedCount])
-      shiftedCount++
-      protectedStart--
-      shiftLimit--
-      const markerText = `[Earlier ${droppedBlocks.length} conversation message(s) omitted to fit 64KB frame]`
-      if (dropAt === 1) {
-        blocks[0] = { text: markerText, msgIndex: -1, role: "system_note" }
-      } else {
-        blocks.unshift({ text: markerText, msgIndex: -1, role: "system_note" })
-        protectedStart++
-      }
       text = composeText(sysText, toolsText, blocks)
-      curBytes = measure(text)
     }
   }
 
-  // Stage 3: Trim long system prompt text, leaving tools protocol and protected turn intact
-  if (!isResume && curBytes > maxFrameBytes && sysText) {
+  // Stage 3: Trim long system prompt text, leaving tools protocol and latest user turn intact
+  if (!isResume && measure(text) > maxFrameBytes && sysText) {
     const withoutSysBytes = measure(composeText("", toolsText, blocks))
-    let sysBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
-    sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
+    const charBudget = Math.max(0, Math.floor((maxFrameBytes - withoutSysBytes) * 0.65))
+    sysText = charBudget > 256 ? truncateMiddle(sysText, charBudget) : ""
     text = composeText(sysText, toolsText, blocks)
-    curBytes = measure(text)
-    for (let over = curBytes - maxFrameBytes; over > 0 && sysText.length > 0; over = curBytes - maxFrameBytes) {
-      sysBudget = sysBudget - Math.max(200, Math.ceil(over * 0.75))
-      sysText = sysBudget > 256 ? truncateMiddle(origSysText, sysBudget) : ""
+    for (let over = measure(text) - maxFrameBytes; over > 0 && sysText.length > 0; over = measure(text) - maxFrameBytes) {
+      const nextLen = sysText.length - Math.max(200, Math.ceil(over * 0.75))
+      sysText = nextLen > 256 ? truncateMiddle(sysText, nextLen) : ""
       text = composeText(sysText, toolsText, blocks)
-      curBytes = measure(text)
     }
   }
 
-  // Stage 4: Spill full protected zone (+ dropped earlier history on new threads) into a per-turn
-  // overflow attachment with section headers & exact line numbers, and build BOTH no-attachment and
-  // with-attachment inline texts structurally (zero string search).
+  // Stage 4: Final safety clamp on user body text so outbound frame stays under maxFrameBytes
   let overflowUserText = ""
-  let textWithAttachmentNote = ""
-  const mayAttachOverflow = !opts.disableAttachments && opts.uploadLargeText !== false
-  const historyToSpill = !isResume ? droppedBlocks : []
-
-  if (curBytes > maxFrameBytes && blocks.length) {
-    const protectedSlice = blocks.slice(protectedStart)
-    const origProtectedTexts = protectedSlice.map((b) => b.text)
-    const origProtectedRoles = protectedSlice.map((b) => b.role)
-    const origProtectedLens = origProtectedTexts.map((t) => t.length)
-    const overflowDoc = buildOverflowDocument(historyToSpill, protectedSlice, overflowAttachmentName)
-    overflowUserText = overflowDoc.text
-    const attachNote = buildOverflowAttachmentNote(overflowAttachmentName, overflowDoc.droppedRange)
-    const stage4MaxBytes =
-      mayAttachOverflow && maxFrameBytes > OVERFLOW_ATTACHMENT_RESERVE_BYTES + 2048
-        ? maxFrameBytes - OVERFLOW_ATTACHMENT_RESERVE_BYTES
-        : maxFrameBytes
-
-    const buildProtectedVariants = (budgetChars) => {
-      const budgets = allocateProportionalBudgets(origProtectedLens, budgetChars)
-      const plainBlocks = blocks.slice()
-      const attachBlocks = blocks.slice()
-      for (let k = 0; k < protectedSlice.length; k++) {
-        const orig = origProtectedTexts[k]
-        const targetLen = budgets[k]
-        plainBlocks[protectedStart + k] = {
-          ...blocks[protectedStart + k],
-          text:
-            orig.length > targetLen
-              ? truncateMiddle(orig, targetLen, {
-                  isToolResult: origProtectedRoles[k] === "tool",
-                })
-              : orig,
-        }
-        attachBlocks[protectedStart + k] = {
-          ...blocks[protectedStart + k],
-          text:
-            orig.length > targetLen
-              ? truncateMiddle(orig, targetLen, {
-                  isToolResult: origProtectedRoles[k] === "tool",
-                  attachmentRef: overflowDoc.protectedRanges[k],
-                })
-              : orig,
-        }
-      }
-      blocks = plainBlocks
-      text = composeText(sysText, toolsText, plainBlocks)
-      textWithAttachmentNote = composeText(sysText, toolsText, attachBlocks, attachNote)
-    }
-
-    const totalOrigChars = origProtectedLens.reduce((a, b) => a + b, 0)
-    const preBlocks = blocks.slice(0, protectedStart)
-    const baseBytes = measure(composeText(sysText, toolsText, preBlocks))
-    const availableWireBytes = Math.max(0, stage4MaxBytes - baseBytes)
-    const currentProtectedBytes = Math.max(1, curBytes - baseBytes)
-    const minTotalBudget = protectedSlice.length * 64
-    let totalBudget = Math.max(
-      minTotalBudget,
-      Math.floor(totalOrigChars * (availableWireBytes / currentProtectedBytes) * 0.95),
-    )
-
-    buildProtectedVariants(totalBudget)
-    let over = Math.max(measure(text), mayAttachOverflow ? measure(textWithAttachmentNote) : 0) - stage4MaxBytes
-    while (over > 0 && totalBudget > minTotalBudget) {
-      const cutByOver = Math.max(200, Math.ceil(over * 0.75))
-      const curProtectedBytes = Math.max(1, measure(text) - baseBytes)
-      const scaled = Math.floor(totalBudget * (availableWireBytes / curProtectedBytes) * 0.92)
-      const nextBudget = Math.max(minTotalBudget, Math.min(totalBudget - cutByOver, scaled))
-      totalBudget = nextBudget >= totalBudget ? Math.max(minTotalBudget, totalBudget - cutByOver) : nextBudget
-      buildProtectedVariants(totalBudget)
-      over = Math.max(measure(text), mayAttachOverflow ? measure(textWithAttachmentNote) : 0) - stage4MaxBytes
-    }
-
-    // Last-resort fallback: if a pre-protected block still pushes us over stage4MaxBytes, drop it
-    while (over > 0 && protectedStart > 0) {
-      blocks.shift()
-      protectedStart--
-      buildProtectedVariants(totalBudget)
-      over = Math.max(measure(text), mayAttachOverflow ? measure(textWithAttachmentNote) : 0) - stage4MaxBytes
-    }
-  } else if (historyToSpill.length > 0 && mayAttachOverflow) {
-    // New thread dropped earlier history in Stage 2 without needing Stage 4 truncation:
-    // still preserve dropped history in the per-turn overflow attachment if the note fits cleanly.
-    const overflowDoc = buildOverflowDocument(historyToSpill, [], overflowAttachmentName)
-    const attachNote = buildOverflowAttachmentNote(overflowAttachmentName, overflowDoc.droppedRange)
-    const candidate = composeText(sysText, toolsText, blocks, attachNote)
-    if (measure(candidate) <= maxFrameBytes - 500) {
-      overflowUserText = overflowDoc.text
-      textWithAttachmentNote = candidate
+  if (measure(text) > maxFrameBytes && blocks.length) {
+    overflowUserText = blocks[blocks.length - 1]
+    let over = measure(text) - maxFrameBytes
+    let last = overflowUserText
+    while (over > 0 && last.length > 256) {
+      const cut = Math.max(200, Math.floor(over * 0.75))
+      last = truncateMiddle(last, Math.max(128, last.length - cut))
+      blocks[blocks.length - 1] = last
+      text = composeText(sysText, toolsText, blocks)
+      over = measure(text) - maxFrameBytes
     }
   }
 
@@ -1372,15 +852,11 @@ export function openaiToSncsRequest(body, opts = {}) {
     modelId,
     hasTools,
     isResume,
-    lang,
     toolsSig,
-    toolMap,
     rawSystemText,
     convoHashes,
     imageUrls: collectImageUrls(outboundMsgs),
     overflowUserText,
-    overflowAttachmentName,
-    textWithAttachmentNote,
     stream: body?.stream === true,
     outpostId,
     workingSessionId,
@@ -1523,9 +999,7 @@ function parseToolBlock(openTag, inner, paramTypeMap) {
 
 /**
  * Stateful splitter for `<tool_call>...</tool_call>` and `<function_calls><invoke>...</function_calls>`
- * blocks inside streamed text chunks. Ignores tags inside Markdown fenced code blocks or inline backticks,
- * validates tool names against declared tools when provided, and drops hallucinated `<tool_result` blocks
- * emitted after a tool call.
+ * blocks inside streamed text chunks.
  */
 export function createToolCallSplitter(enabled, tools = []) {
   const paramTypeMap = buildParamTypeMap(tools)
@@ -1534,32 +1008,6 @@ export function createToolCallSplitter(enabled, tools = []) {
   let toolIndex = 0
   const calls = []
 
-  // Markdown code-span / code-fence tracking outside active tool blocks
-  let inFence = false
-  let fenceLen = 0
-  let inlineTicks = 0
-  let atLineStart = true
-  let prevCharWasNewline = false
-
-  // Post-tool-call hallucinated `<tool_result` guard
-  let afterToolCall = false
-  let discardHallucinated = false
-
-  const HALLUCINATED_TAG = "<tool_result"
-
-  const advancePlainChar = (ch) => {
-    if (ch === "\n") {
-      if (prevCharWasNewline && inlineTicks > 0) inlineTicks = 0
-      prevCharWasNewline = true
-      atLineStart = true
-    } else if (ch === "\r") {
-      // keep newline state
-    } else {
-      prevCharWasNewline = false
-      if (ch !== " " && ch !== "\t") atLineStart = false
-    }
-  }
-
   const processChunk = (delta, flushAll = false) => {
     const textPieces = []
     const toolCalls = []
@@ -1567,18 +1015,37 @@ export function createToolCallSplitter(enabled, tools = []) {
       if (delta) textPieces.push(delta)
       return { text: textPieces.join(""), toolCalls }
     }
-    if (discardHallucinated) {
-      return { text: "", toolCalls }
-    }
     buf += delta
-
     while (buf.length > 0) {
-      if (discardHallucinated) {
-        buf = ""
+      if (!activePair) {
+        let bestIdx = -1
+        let bestPair = null
+        for (const pair of TAG_PAIRS) {
+          const idx = buf.indexOf(pair[0])
+          if (idx >= 0 && (bestIdx < 0 || idx < bestIdx)) {
+            bestIdx = idx
+            bestPair = pair
+          }
+        }
+        if (bestPair) {
+          if (bestIdx > 0) textPieces.push(buf.slice(0, bestIdx))
+          buf = buf.slice(bestIdx + bestPair[0].length)
+          activePair = bestPair
+          continue
+        }
+        if (flushAll) {
+          textPieces.push(buf)
+          buf = ""
+          break
+        }
+        const hold = maxOpenTagHold(buf)
+        const safeLen = buf.length - hold
+        if (safeLen > 0) {
+          textPieces.push(buf.slice(0, safeLen))
+          buf = buf.slice(safeLen)
+        }
         break
-      }
-
-      if (activePair) {
+      } else {
         const [openTag, closeTag] = activePair
         const idx = buf.indexOf(closeTag)
         if (idx >= 0) {
@@ -1587,30 +1054,18 @@ export function createToolCallSplitter(enabled, tools = []) {
           activePair = null
           const parsedList = parseToolBlock(openTag, inner, paramTypeMap)
           if (parsedList) {
-            const validCalls = paramTypeMap.size ? parsedList.filter((p) => paramTypeMap.has(p.name)) : parsedList
-            if (validCalls.length > 0) {
-              for (const parsed of validCalls) {
-                const call = {
-                  index: toolIndex++,
-                  id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-                  type: "function",
-                  function: parsed,
-                }
-                calls.push(call)
-                toolCalls.push(call)
+            for (const parsed of parsedList) {
+              const call = {
+                index: toolIndex++,
+                id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+                type: "function",
+                function: parsed,
               }
-              afterToolCall = true
-              atLineStart = false
-              prevCharWasNewline = false
-            } else {
-              textPieces.push(openTag + inner + closeTag)
-              atLineStart = false
-              prevCharWasNewline = false
+              calls.push(call)
+              toolCalls.push(call)
             }
           } else {
             textPieces.push(openTag + inner + closeTag)
-            atLineStart = false
-            prevCharWasNewline = false
           }
           continue
         }
@@ -1621,120 +1076,7 @@ export function createToolCallSplitter(enabled, tools = []) {
         }
         break
       }
-
-      // If we just emitted a tool call and are outside code blocks, check whether the model
-      // starts fabricating a `<tool_result...>` block right after optional whitespace.
-      if (afterToolCall && !inFence && inlineTicks === 0) {
-        let wsEnd = 0
-        while (wsEnd < buf.length && /\s/.test(buf[wsEnd])) wsEnd++
-        if (wsEnd === buf.length) {
-          if (flushAll) {
-            for (let k = 0; k < buf.length; k++) advancePlainChar(buf[k])
-            textPieces.push(buf)
-            buf = ""
-            afterToolCall = false
-          }
-          break
-        }
-        const rest = buf.slice(wsEnd)
-        const lowerRest = rest.toLowerCase()
-        if (lowerRest.startsWith(HALLUCINATED_TAG)) {
-          const nextCh = rest[HALLUCINATED_TAG.length]
-          if (nextCh === undefined && !flushAll) break
-          if (nextCh === undefined || /[\s>/]/.test(nextCh)) {
-            discardHallucinated = true
-            buf = ""
-            break
-          }
-        } else if (!flushAll && HALLUCINATED_TAG.startsWith(lowerRest)) {
-          // Partial `<tool_result` prefix right after tool call — hold until more arrives
-          break
-        }
-        // Check if another real tool call immediately follows whitespace; otherwise normal text resumes
-        const isNextToolOpen = TAG_PAIRS.some(([open]) => rest.startsWith(open))
-        const isPartialToolOpen = !flushAll && TAG_PAIRS.some(([open]) => open.startsWith(rest))
-        if (isPartialToolOpen && !isNextToolOpen) break
-        if (!isNextToolOpen) afterToolCall = false
-      }
-
-      // Scan outside activePair, tracking Markdown fences (```) and inline backticks (`)
-      let i = 0
-      let emittedEnd = 0
-      let needMore = false
-
-      while (i < buf.length) {
-        const ch = buf[i]
-
-        if (ch === "`") {
-          let end = i + 1
-          while (end < buf.length && buf[end] === "`") end++
-          if (end === buf.length && !flushAll) {
-            // Trailing backticks may continue in the next chunk
-            needMore = true
-            break
-          }
-          const count = end - i
-          if (inFence) {
-            if (atLineStart && count >= fenceLen) {
-              inFence = false
-              fenceLen = 0
-            }
-          } else if (inlineTicks > 0) {
-            if (count === inlineTicks) inlineTicks = 0
-          } else if (atLineStart && count >= 3) {
-            inFence = true
-            fenceLen = count
-          } else {
-            inlineTicks = count
-          }
-          prevCharWasNewline = false
-          atLineStart = false
-          i = end
-          emittedEnd = end
-          continue
-        }
-
-        if (!inFence && inlineTicks === 0 && ch === "<") {
-          let matchedPair = null
-          for (const pair of TAG_PAIRS) {
-            if (buf.startsWith(pair[0], i)) {
-              matchedPair = pair
-              break
-            }
-          }
-          if (matchedPair) {
-            if (i > 0) textPieces.push(buf.slice(0, i))
-            buf = buf.slice(i + matchedPair[0].length)
-            activePair = matchedPair
-            emittedEnd = -1
-            break
-          }
-          if (!flushAll) {
-            const tail = buf.slice(i)
-            const partial = TAG_PAIRS.some(([open]) => open.startsWith(tail))
-            if (partial) {
-              needMore = true
-              break
-            }
-          }
-        }
-
-        advancePlainChar(ch)
-        i++
-        emittedEnd = i
-      }
-
-      if (emittedEnd === -1) {
-        // Entered activePair — loop again to look for closeTag
-        continue
-      }
-      if (emittedEnd > 0) {
-        textPieces.push(buf.slice(0, emittedEnd))
-        buf = buf.slice(emittedEnd)
-      }
-      if (needMore || buf.length === 0) break
     }
-
     return { text: textPieces.join(""), toolCalls }
   }
 
@@ -1774,33 +1116,6 @@ export function stripReasoningEnabled(opts = {}) {
  * or a completed OpenAI JSON Response. Reuses cached `threadId` incrementally when the prefix matches,
  * transparently falling back to a fresh `threadId` if a resumed thread fails before streaming begins.
  */
-function waitForInflight(pending, signal) {
-  if (!signal) return pending
-  if (signal.aborted) {
-    const err = new Error("Request aborted")
-    err.status = 499
-    return Promise.reject(err)
-  }
-  return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      const err = new Error("Request aborted")
-      err.status = 499
-      reject(err)
-    }
-    signal.addEventListener("abort", onAbort, { once: true })
-    pending.then(
-      () => {
-        signal.removeEventListener("abort", onAbort)
-        resolve()
-      },
-      () => {
-        signal.removeEventListener("abort", onAbort)
-        resolve()
-      },
-    )
-  })
-}
-
 export async function executeSncsChat(a, openaiBody, opts = {}) {
   const WS = opts.WebSocket ?? globalThis.WebSocket
   if (typeof WS !== "function") {
@@ -1811,8 +1126,6 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
   const accountKey = accountKeyOf(a)
 
   let resumeState = null
-  let releaseInflight = null
-
   if (stateful) {
     const rawMessages = Array.isArray(openaiBody?.messages) ? openaiBody.messages : []
     const sysParts = []
@@ -1831,52 +1144,14 @@ export async function executeSncsChat(a, openaiBody, opts = {}) {
     const toolChoice = openaiBody?.tool_choice
     const hasTools = tools.length > 0 && toolChoice !== "none"
     const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
-    const sysJoined = sysParts.join("\n\n")
-    const sessionId = opts.sessionId || ""
-
-    // Tool-less sidecar requests (e.g. Zed title generation / summarization) sharing a tool-bearing
-    // main conversation MUST stay completely stateless so they neither pollute the server thread
-    // nor overwrite the main thread's cache entries.
-    if (!hasTools && threadStore.hasToolThread?.(accountKey, sessionId, convo)) {
-      return await runSncsTurn(a, openaiBody, {
-        ...opts,
-        stateful: false,
-        resumeState: null,
-        threadStore: null,
-        accountKey,
-        WS,
-      })
-    }
-
-    const doLookup = () => threadStore.lookup(accountKey, sessionId, toolsSig, sysJoined, convo, { hasTools })
-    resumeState = doLookup()
-    while (resumeState?.threadId) {
-      const pending = threadStore.getInflight?.(resumeState.threadId)
-      if (!pending) break
-      await waitForInflight(pending, opts.signal)
-      resumeState = doLookup()
-    }
-    if (resumeState?.threadId && threadStore.acquire) {
-      releaseInflight = threadStore.acquire(resumeState.threadId)
-    }
+    resumeState = threadStore.lookup(accountKey, opts.sessionId || "", toolsSig, sysParts.join("\n\n"), convo)
   }
 
   try {
-    return await runSncsTurn(a, openaiBody, {
-      ...opts,
-      resumeState,
-      accountKey,
-      threadStore,
-      WS,
-      onTurnDone: releaseInflight,
-    })
+    return await runSncsTurn(a, openaiBody, { ...opts, resumeState, accountKey, threadStore, WS })
   } catch (err) {
-    const canRetryFresh = Boolean(resumeState && err?.status !== 401 && !opts.signal?.aborted)
-    if (canRetryFresh) {
+    if (resumeState && err?.status !== 401 && !opts.signal?.aborted) {
       threadStore.invalidate(accountKey, opts.sessionId || "", resumeState.threadId)
-    }
-    releaseInflight?.()
-    if (canRetryFresh) {
       return await runSncsTurn(a, openaiBody, { ...opts, resumeState: null, accountKey, threadStore, WS })
     }
     throw err
@@ -1924,13 +1199,12 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
   }
 
   if (hasOverflow) {
-    const attachName = reqPlan.overflowAttachmentName || "prompt_context.txt"
     tasks.push(
       (async () => {
         const bytes = Buffer.from(reqPlan.overflowUserText, "utf8")
         const uploaded = await uploader(
           a,
-          { name: attachName, mimeType: "text/plain", bytes, threadId: reqPlan.threadId },
+          { name: "prompt_context.txt", mimeType: "text/plain", bytes, threadId: reqPlan.threadId },
           opts,
         )
         return serializeWireAttachment(uploaded)
@@ -1951,7 +1225,7 @@ async function prepareTurnAttachments(a, reqPlan, opts) {
 }
 
 async function runSncsTurn(a, openaiBody, ctx) {
-  const { WS, accountKey, threadStore, onTurnDone, ...opts } = ctx
+  const { WS, accountKey, threadStore, ...opts } = ctx
   const gateway = isGatewayProvider(a.providerType)
   const stripReasoning = stripReasoningEnabled(opts)
   const reqPlan = openaiToSncsRequest(openaiBody, opts)
@@ -1961,10 +1235,6 @@ async function runSncsTurn(a, openaiBody, ctx) {
   const attachments = await prepareTurnAttachments(a, reqPlan, opts)
   if (attachments.length) {
     reqPlan.userMessagePayload.attachments = attachments
-    const expectedOverflowName = reqPlan.overflowAttachmentName || "prompt_context.txt"
-    if (reqPlan.textWithAttachmentNote && attachments.some((att) => att?.name === expectedOverflowName)) {
-      reqPlan.userMessagePayload.text = reqPlan.textWithAttachmentNote
-    }
   }
 
   const surface = surfaceTypeForPlatform(opts.platform)
@@ -2079,20 +1349,12 @@ async function runSncsTurn(a, openaiBody, ctx) {
       if (!settledInitial) {
         settledInitial = true
         reject(err)
-      } else {
-        // Stream already began (server thread holds a half-finished turn): invalidate cached thread
-        // before releasing the inflight lock so the next request starts clean instead of duplicating turns.
-        if (threadStore && opts.stateful !== false) {
-          threadStore.invalidate(accountKey, opts.sessionId || "", reqPlan.threadId)
-        }
-        if (sseController) {
-          try {
-            sseController.enqueue(sseEnc.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`))
-            sseController.enqueue(sseEnc.encode("data: [DONE]\n\n"))
-            sseController.close()
-          } catch {}
-        }
-        onTurnDone?.()
+      } else if (sseController) {
+        try {
+          sseController.enqueue(sseEnc.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`))
+          sseController.enqueue(sseEnc.encode("data: [DONE]\n\n"))
+          sseController.close()
+        } catch {}
       }
     }
 
@@ -2104,25 +1366,14 @@ async function runSncsTurn(a, openaiBody, ctx) {
         content: assistantContent,
         tool_calls: splitter.calls,
       })
-      const expectedAssistantCallsSig = splitter.calls.length
-        ? canonicalJson(normalizeToolCallsForDigest(splitter.calls))
-        : ""
-      const expectedAssistantTextSig = !splitter.calls.length
-        ? sha256Hex(textFromContent(assistantContent).trim())
-        : ""
       const toolCallIds = splitter.calls.map((c) => c?.id).filter(Boolean)
       threadStore.commit(accountKey, opts.sessionId || "", {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
-        hasTools: Boolean(reqPlan.hasTools),
-        lang: reqPlan.lang || "",
         toolsSig: reqPlan.toolsSig,
-        toolMap: reqPlan.toolMap,
         sysText: reqPlan.rawSystemText,
         msgHashes: reqPlan.convoHashes,
         expectedAssistantSig,
-        expectedAssistantCallsSig,
-        expectedAssistantTextSig,
         toolCallIds,
       })
     }
@@ -2194,7 +1445,6 @@ async function runSncsTurn(a, openaiBody, ctx) {
         )
       }
       cleanup()
-      onTurnDone?.()
     }
 
     const openSseStream = () => {
@@ -2206,14 +1456,8 @@ async function runSncsTurn(a, openaiBody, ctx) {
           emitDeltaChunk({ role: "assistant", content: "" })
         },
         cancel() {
-          if (!finished) {
-            finished = true
-            if (threadStore && opts.stateful !== false) {
-              threadStore.invalidate(accountKey, opts.sessionId || "", reqPlan.threadId)
-            }
-          }
+          finished = true
           cleanup()
-          onTurnDone?.()
         },
       })
       resolve(
