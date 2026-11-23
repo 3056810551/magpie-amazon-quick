@@ -764,36 +764,84 @@ function formatConvoBlocks(msgs) {
  * In-memory bounded thread cache mapping conversation prefixes & session IDs to Amazon Quick `threadId`s.
  */
 export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_CACHE_TTL_MS) {
-  const byKey = new Map()
+  // Thread-level LRU (`threads`: threadId -> record) with O(1) secondary index Maps so a single
+  // thread with many parallel tool_call_ids still counts as 1 LRU entry instead of evicting others.
+  const threads = new Map()
+  const bySession = new Map()
+  const byHead = new Map()
+  const byUser0 = new Map()
+  const byToolCall = new Map()
   const inflight = new Map()
 
   const entryHasTools = (entry) =>
     Boolean(entry?.hasTools || (entry?.toolMap && Object.keys(entry.toolMap).length > 0))
 
-  const prune = (now) => {
-    for (const [k, v] of byKey) {
-      if (now - v.updatedAt > ttlMs) byKey.delete(k)
-    }
-    while (byKey.size > maxEntries) {
-      const oldest = byKey.keys().next()
-      if (oldest.done) break
-      byKey.delete(oldest.value)
+  const removeIndexes = (record) => {
+    if (!record) return
+    const tid = record.threadId
+    if (record._sessionKey && bySession.get(record._sessionKey) === tid) bySession.delete(record._sessionKey)
+    if (record._headKey && byHead.get(record._headKey) === tid) byHead.delete(record._headKey)
+    if (record._user0Key && byUser0.get(record._user0Key) === tid) byUser0.delete(record._user0Key)
+    if (Array.isArray(record._tcKeys)) {
+      for (const k of record._tcKeys) {
+        if (byToolCall.get(k) === tid) byToolCall.delete(k)
+      }
     }
   }
 
-  const touch = (k) => {
-    const v = byKey.get(k)
-    if (!v) return null
-    if (Date.now() - v.updatedAt > ttlMs) {
-      byKey.delete(k)
+  const deleteThread = (threadId) => {
+    if (!threadId) return
+    const record = threads.get(threadId)
+    if (!record) return
+    threads.delete(threadId)
+    removeIndexes(record)
+  }
+
+  const prune = (now) => {
+    for (const [tid, rec] of threads) {
+      if (now - rec.updatedAt > ttlMs) deleteThread(tid)
+    }
+    while (threads.size > maxEntries) {
+      const oldest = threads.keys().next()
+      if (oldest.done) break
+      deleteThread(oldest.value)
+    }
+  }
+
+  const touchThread = (threadId) => {
+    if (!threadId) return null
+    const rec = threads.get(threadId)
+    if (!rec) return null
+    if (Date.now() - rec.updatedAt > ttlMs) {
+      deleteThread(threadId)
       return null
     }
-    byKey.delete(k)
-    byKey.set(k, v)
-    return v
+    threads.delete(threadId)
+    threads.set(threadId, rec)
+    return rec
+  }
+
+  const assistantMatchesEntry = (entry, msg, msgHash) => {
+    if (entry.expectedAssistantCallsSig) {
+      const actualCallsSig = canonicalJson(normalizeToolCallsForDigest(msg?.tool_calls))
+      return actualCallsSig === entry.expectedAssistantCallsSig
+    }
+    if (entry.expectedAssistantTextSig || entry.expectedAssistantSig) {
+      const hasCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
+      if (hasCalls) return false
+      if (entry.expectedAssistantSig && msgHash === entry.expectedAssistantSig) return true
+      if (entry.expectedAssistantTextSig) {
+        return sha256Hex(textFromContent(msg?.content).trim()) === entry.expectedAssistantTextSig
+      }
+      return false
+    }
+    return true
   }
 
   return {
+    get size() {
+      return threads.size
+    },
     getInflight(threadId) {
       return threadId ? inflight.get(threadId) || null : null
     },
@@ -814,19 +862,19 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     },
     hasToolThread(accountKey, sessionId, convoMessages) {
       if (sessionId) {
-        const s = touch(`sess:${accountKey}|${sessionId}`)
+        const s = touchThread(bySession.get(`${accountKey}|${sessionId}`))
         if (s && s.accountKey === accountKey && entryHasTools(s)) return true
       }
       if (Array.isArray(convoMessages) && convoMessages.length) {
         const firstHash = messageDigest(convoMessages[0])
-        const u = touch(`user0:${accountKey}|${firstHash}`)
+        const u = touchThread(byUser0.get(`${accountKey}|${firstHash}`))
         if (u && u.accountKey === accountKey && entryHasTools(u)) return true
         for (let i = convoMessages.length - 1; i >= 0; i--) {
           const m = convoMessages[i]
           if (String(m?.role || "").toLowerCase() !== "tool") continue
           const tcId = String(m?.tool_call_id || "")
           if (!tcId) continue
-          const t = touch(`tc:${accountKey}|${tcId}`)
+          const t = touchThread(byToolCall.get(`${accountKey}|${tcId}`))
           if (t && t.accountKey === accountKey && entryHasTools(t)) return true
         }
       }
@@ -847,8 +895,8 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
           if (r !== "tool") break
           const tcId = String(convoMessages[i]?.tool_call_id || "")
           if (!tcId) continue
-          const tcKey = `tc:${accountKey}|${tcId}`
-          const entry = touch(tcKey)
+          const tcKey = `${accountKey}|${tcId}`
+          const entry = touchThread(byToolCall.get(tcKey))
           if (!entry || entry.accountKey !== accountKey) continue
           if (!reqHasTools && entryHasTools(entry)) continue
           let deltaStart = i
@@ -859,7 +907,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
           if (systemUpdate === null) continue
           const toolsChanged = entry.toolsSig !== toolsSig
           return {
-            key: tcKey,
+            key: `tc:${tcKey}`,
             threadId: entry.threadId,
             workingSessionId: entry.workingSessionId,
             deltaMessages: convoMessages.slice(deltaStart),
@@ -875,12 +923,20 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
 
       // 2. Match by session ID, head (toolsSig + first user message), or first user message fallback
       const candidates = []
-      if (sessionId) candidates.push(`sess:${accountKey}|${sessionId}`)
-      candidates.push(`head:${accountKey}|${toolsSig}|${hashes[0]}`)
-      candidates.push(`user0:${accountKey}|${hashes[0]}`)
+      if (sessionId) {
+        const sk = `${accountKey}|${sessionId}`
+        candidates.push([`sess:${sk}`, bySession.get(sk)])
+      }
+      const hk = `${accountKey}|${toolsSig}|${hashes[0]}`
+      candidates.push([`head:${hk}`, byHead.get(hk)])
+      const uk = `${accountKey}|${hashes[0]}`
+      candidates.push([`user0:${uk}`, byUser0.get(uk)])
 
-      for (const k of candidates) {
-        const entry = touch(k)
+      const seenTids = new Set()
+      for (const [label, tid] of candidates) {
+        if (!tid || seenTids.has(tid)) continue
+        seenTids.add(tid)
+        const entry = touchThread(tid)
         if (!entry) continue
         if (entry.accountKey !== accountKey) continue
         if (!reqHasTools && entryHasTools(entry)) continue
@@ -895,6 +951,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         }
         if (!prefixOk) continue
         if (roleOf(convoMessages[prefixLen]) !== "assistant") continue
+        if (!assistantMatchesEntry(entry, convoMessages[prefixLen], hashes[prefixLen])) continue
         let deltaStart = prefixLen + 1
         while (deltaStart < convoMessages.length && roleOf(convoMessages[deltaStart]) === "assistant") {
           deltaStart++
@@ -904,7 +961,7 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         if (systemUpdate === null) continue
         const toolsChanged = entry.toolsSig !== toolsSig
         return {
-          key: k,
+          key: label,
           threadId: entry.threadId,
           workingSessionId: entry.workingSessionId,
           deltaMessages: convoMessages.slice(deltaStart),
@@ -920,48 +977,56 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     },
     commit(accountKey, sessionId, state) {
       const now = Date.now()
-      const record = { ...state, accountKey, updatedAt: now }
-      // Remove stale tool_call_id and head bindings for this threadId before registering new ones
-      for (const [k, v] of byKey) {
-        if ((k.startsWith(`tc:${accountKey}|`) || k.startsWith(`head:${accountKey}|`)) && v.threadId === record.threadId) {
-          byKey.delete(k)
-        }
+      const tid = state?.threadId
+      if (!tid) return
+      const prev = threads.get(tid)
+      if (prev) removeIndexes(prev)
+
+      const sessionKey = sessionId ? `${accountKey}|${sessionId}` : ""
+      const headKey = state?.msgHashes?.length ? `${accountKey}|${state.toolsSig}|${state.msgHashes[0]}` : ""
+      const user0Key = state?.msgHashes?.length ? `${accountKey}|${state.msgHashes[0]}` : ""
+      const tcKeys = Array.isArray(state?.toolCallIds)
+        ? state.toolCallIds.filter(Boolean).map((id) => `${accountKey}|${id}`)
+        : []
+
+      const record = {
+        ...state,
+        accountKey,
+        updatedAt: now,
+        _sessionKey: sessionKey,
+        _headKey: headKey,
+        _user0Key: user0Key,
+        _tcKeys: tcKeys,
       }
-      if (sessionId) {
-        const sk = `sess:${accountKey}|${sessionId}`
-        byKey.delete(sk)
-        byKey.set(sk, record)
-      }
-      if (record.msgHashes?.length) {
-        const hk = `head:${accountKey}|${record.toolsSig}|${record.msgHashes[0]}`
-        byKey.delete(hk)
-        byKey.set(hk, record)
-        const uk = `user0:${accountKey}|${record.msgHashes[0]}`
-        byKey.delete(uk)
-        byKey.set(uk, record)
-      }
-      if (Array.isArray(record.toolCallIds)) {
-        for (const id of record.toolCallIds) {
-          if (!id) continue
-          const tk = `tc:${accountKey}|${id}`
-          byKey.delete(tk)
-          byKey.set(tk, record)
-        }
-      }
+      threads.delete(tid)
+      threads.set(tid, record)
+      if (sessionKey) bySession.set(sessionKey, tid)
+      if (headKey) byHead.set(headKey, tid)
+      if (user0Key) byUser0.set(user0Key, tid)
+      for (const tk of tcKeys) byToolCall.set(tk, tid)
       prune(now)
     },
     invalidate(accountKey, sessionId, threadId) {
-      for (const [k, v] of byKey) {
-        if (
-          (threadId && v.threadId === threadId && v.accountKey === accountKey) ||
-          (sessionId && k === `sess:${accountKey}|${sessionId}`)
-        ) {
-          byKey.delete(k)
+      if (threadId) {
+        const rec = threads.get(threadId)
+        if (rec && rec.accountKey === accountKey) deleteThread(threadId)
+      }
+      if (sessionId) {
+        const sk = `${accountKey}|${sessionId}`
+        const tid = bySession.get(sk)
+        if (tid) {
+          const rec = threads.get(tid)
+          if (rec && rec.accountKey === accountKey) deleteThread(tid)
+          else bySession.delete(sk)
         }
       }
     },
     clear() {
-      byKey.clear()
+      threads.clear()
+      bySession.clear()
+      byHead.clear()
+      byUser0.clear()
+      byToolCall.clear()
       inflight.clear()
     },
   }
@@ -1868,6 +1933,11 @@ async function runSncsTurn(a, openaiBody, ctx) {
         settledInitial = true
         reject(err)
       } else {
+        // Stream already began (server thread holds a half-finished turn): invalidate cached thread
+        // before releasing the inflight lock so the next request starts clean instead of duplicating turns.
+        if (threadStore && opts.stateful !== false) {
+          threadStore.invalidate(accountKey, opts.sessionId || "", reqPlan.threadId)
+        }
         if (sseController) {
           try {
             sseController.enqueue(sseEnc.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`))
@@ -1887,6 +1957,12 @@ async function runSncsTurn(a, openaiBody, ctx) {
         content: assistantContent,
         tool_calls: splitter.calls,
       })
+      const expectedAssistantCallsSig = splitter.calls.length
+        ? canonicalJson(normalizeToolCallsForDigest(splitter.calls))
+        : ""
+      const expectedAssistantTextSig = !splitter.calls.length
+        ? sha256Hex(textFromContent(assistantContent).trim())
+        : ""
       const toolCallIds = splitter.calls.map((c) => c?.id).filter(Boolean)
       threadStore.commit(accountKey, opts.sessionId || "", {
         threadId: reqPlan.threadId,
@@ -1898,6 +1974,8 @@ async function runSncsTurn(a, openaiBody, ctx) {
         sysText: reqPlan.rawSystemText,
         msgHashes: reqPlan.convoHashes,
         expectedAssistantSig,
+        expectedAssistantCallsSig,
+        expectedAssistantTextSig,
         toolCallIds,
       })
     }
@@ -1981,7 +2059,12 @@ async function runSncsTurn(a, openaiBody, ctx) {
           emitDeltaChunk({ role: "assistant", content: "" })
         },
         cancel() {
-          finished = true
+          if (!finished) {
+            finished = true
+            if (threadStore && opts.stateful !== false) {
+              threadStore.invalidate(accountKey, opts.sessionId || "", reqPlan.threadId)
+            }
+          }
           cleanup()
           onTurnDone?.()
         },

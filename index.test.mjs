@@ -2213,3 +2213,197 @@ test("line-boundary truncation, dropped-history marker + attachment, frame budge
   assert.notEqual(sent[3].thread_id, sent[2].thread_id, "must open fresh thread when >20k system prompt appears from empty prevSys")
   assert.ok(sent[3].text.includes("IMPORTANT_RULE_START"), "new thread must include full <instructions> with new system prompt")
 })
+
+test("expectedAssistantSig rejects edited/regenerated replies, thread-level LRU preserves sessions across 10 tool calls, and mid-stream cancel/error invalidates thread", async () => {
+  const acct = { providerType: "social", access: "tok-lru", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "lru-acct" }
+  const readTool = {
+    type: "function",
+    function: { name: "read_file", description: "Read", parameters: { type: "object", properties: { path: { type: "string" } } } },
+  }
+
+  // 1. Thread-level LRU: maxEntries=2 with 10 parallel tool_call_ids on thread 2 must NOT evict thread 1
+  const lruStore = createThreadStore(2)
+  const sentLru = []
+  let lruTurn = 0
+  const LruWS = makeMockWebSocketClass((ws) => {
+    const t = ++lruTurn
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sentLru.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      const delta =
+        t === 2
+          ? Array.from({ length: 10 }, (_, i) => `<tool_call>{"name":"read_file","arguments":{"path":"f${i}.mjs"}}</tool_call>`).join("")
+          : `reply-${t}`
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: "Thread 1 hello" }] },
+    { WebSocket: LruWS, threadStore: lruStore, sessionId: "lru-s1" },
+  )
+  const tid1 = sentLru[0].thread_id
+
+  // Thread 2 emits 10 parallel tool calls (10 tc: index entries) -> still counts as only 1 thread in LRU
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, tools: [readTool], messages: [{ role: "user", content: "Thread 2 ten tools" }] },
+    { WebSocket: LruWS, threadStore: lruStore, sessionId: "lru-s2" },
+  )
+  assert.equal(lruStore.size, 2, "LRU must count threads, not secondary index keys")
+
+  // Thread 1 must STILL be cached and resumable!
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "user", content: "Thread 1 hello" },
+        { role: "assistant", content: "reply-1" },
+        { role: "user", content: "Thread 1 follow-up" },
+      ],
+    },
+    { WebSocket: LruWS, threadStore: lruStore, sessionId: "lru-s1" },
+  )
+  assert.equal(sentLru[2].thread_id, tid1, "thread 1 must not be evicted by thread 2's 10 tool calls")
+
+  // 2. Edited/regenerated assistant reply fails expectedAssistantSig check and starts a fresh thread
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "user", content: "Thread 1 hello" },
+        { role: "assistant", content: "reply-1" },
+        { role: "user", content: "Thread 1 follow-up" },
+        { role: "assistant", content: "USER_EDITED_DIFFERENT_REPLY" },
+        { role: "user", content: "Continue from edited reply" },
+      ],
+    },
+    { WebSocket: LruWS, threadStore: lruStore, sessionId: "lru-s1" },
+  )
+  assert.notEqual(sentLru[3].thread_id, tid1, "edited assistant reply must not resume stale thread")
+
+  // 3. Mid-stream cancel() and mid-stream failEarly() invalidate the dirty thread
+  const streamStore = createThreadStore()
+  const streamSent = []
+  let streamIdx = 0
+  let emitMidStreamError = null
+  const StreamWS = makeMockWebSocketClass((ws) => {
+    const idx = ++streamIdx
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") streamSent.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      if (idx === 1 || idx === 3) {
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: `ok-${idx}` } })
+        ws.emitAidpEvent({ type: "message_complete", payload: {} })
+      } else if (idx === 2) {
+        // Start streaming, then hang until client cancels
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "partial-before-cancel" } })
+      } else if (idx === 4) {
+        // Start streaming, then fail mid-stream
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: "partial-before-error" } })
+        emitMidStreamError = () => ws.emitAidpEvent({ type: "error", payload: { message: "mid-stream boom" } })
+      } else {
+        ws.emitAidpEvent({ type: "text_delta", payload: { delta: `ok-${idx}` } })
+        ws.emitAidpEvent({ type: "message_complete", payload: {} })
+      }
+    })
+  })
+
+  // Seed thread A
+  await executeSncsChat(
+    acct,
+    { model: "fast", stream: false, messages: [{ role: "user", content: "Stream A" }] },
+    { WebSocket: StreamWS, threadStore: streamStore, sessionId: "st-1" },
+  )
+  const tidA = streamSent[0].thread_id
+
+  // Turn 2 resumes tidA in stream mode, then client cancels mid-stream -> must invalidate tidA
+  const cancelRes = await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: true,
+      messages: [
+        { role: "user", content: "Stream A" },
+        { role: "assistant", content: "ok-1" },
+        { role: "user", content: "Will cancel" },
+      ],
+    },
+    { WebSocket: StreamWS, threadStore: streamStore, sessionId: "st-1" },
+  )
+  const reader = cancelRes.body.getReader()
+  await reader.read()
+  await reader.cancel()
+
+  // Turn 3 after cancel must NOT reuse dirty tidA
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "user", content: "Stream A" },
+        { role: "assistant", content: "ok-1" },
+        { role: "user", content: "Retry after cancel" },
+      ],
+    },
+    { WebSocket: StreamWS, threadStore: streamStore, sessionId: "st-1" },
+  )
+  const tidB = streamSent[2].thread_id
+  assert.notEqual(tidB, tidA, "mid-stream cancel must invalidate cached thread so next turn starts fresh")
+
+  // Turn 4 resumes tidB in stream mode, then fails mid-stream -> must invalidate tidB
+  const errRes = await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: true,
+      messages: [
+        { role: "user", content: "Stream A" },
+        { role: "assistant", content: "ok-1" },
+        { role: "user", content: "Retry after cancel" },
+        { role: "assistant", content: "ok-3" },
+        { role: "user", content: "Will fail mid-stream" },
+      ],
+    },
+    { WebSocket: StreamWS, threadStore: streamStore, sessionId: "st-1" },
+  )
+  emitMidStreamError()
+  await errRes.text()
+
+  // Turn 5 after mid-stream error must NOT reuse dirty tidB
+  await executeSncsChat(
+    acct,
+    {
+      model: "fast",
+      stream: false,
+      messages: [
+        { role: "user", content: "Stream A" },
+        { role: "assistant", content: "ok-1" },
+        { role: "user", content: "Retry after cancel" },
+        { role: "assistant", content: "ok-3" },
+        { role: "user", content: "Retry after mid-stream error" },
+      ],
+    },
+    { WebSocket: StreamWS, threadStore: streamStore, sessionId: "st-1" },
+  )
+  assert.notEqual(streamSent[4].thread_id, tidB, "mid-stream failEarly must invalidate cached thread")
+})
