@@ -1602,3 +1602,172 @@ test("prompt_context.txt attachment note is added only after upload succeeds and
   assert.ok(!failFrame.payload.text.includes("prompt_context.txt"), "must NOT mention prompt_context.txt when upload fails")
   assert.match(failFrame.payload.text, /smaller line range/i)
 })
+
+test("resumed thread sends incremental <tools_update> when toolset changes across turns and compacts large tool deltas", async () => {
+  const store = createThreadStore()
+  const acct = { providerType: "social", access: "tok-tools", tenantUrl: "https://qbs-test.plato.ai.aws.dev", accountId: "tools-acct" }
+  const readTool = {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read local file",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    },
+  }
+  const writeTool = {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "Write local file",
+      parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
+    },
+  }
+  const mcpTool = {
+    type: "function",
+    function: {
+      name: "mcp_search",
+      description: "Search docs via MCP",
+      parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
+    },
+  }
+
+  const sentPayloads = []
+  const MockWS = makeMockWebSocketClass((ws) => {
+    ws.readyState = 1
+    ws.onopen?.()
+    queueMicrotask(() => {
+      for (const raw of ws.sent) {
+        const outer = JSON.parse(Buffer.from(raw).toString("utf8"))
+        const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+        if (inner.type === "user_message") sentPayloads.push(inner.payload)
+      }
+      ws.emitAidpEvent({ type: "session_established", payload: {} })
+      ws.emitAidpEvent({ type: "text_delta", payload: { delta: "done" } })
+      ws.emitAidpEvent({ type: "message_complete", payload: {} })
+    })
+  })
+
+  // Turn 1: initial thread with [read_file, write_file]
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool, writeTool],
+      messages: [
+        { role: "system", content: "Workspace agent" },
+        { role: "user", content: "Start auditing" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
+  )
+  assert.equal(sentPayloads.length, 1)
+  const tid = sentPayloads[0].thread_id
+  assert.ok(sentPayloads[0].text.includes("<instructions>"))
+  assert.ok(!sentPayloads[0].text.includes("<tools_update>"))
+
+  // Turn 2: resumed on same thread, write_file removed & mcp_search added (e.g., Zed profile switch / Claude ToolSearch)
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool, mcpTool],
+      messages: [
+        { role: "system", content: "Workspace agent" },
+        { role: "user", content: "Start auditing" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Now search docs with MCP" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
+  )
+  assert.equal(sentPayloads.length, 2)
+  assert.equal(sentPayloads[1].thread_id, tid, "should preserve 1M server thread_id when tools change")
+  assert.ok(!sentPayloads[1].text.includes("<instructions>"), "resumed turn should not resend full <instructions>")
+  const tuMatch = sentPayloads[1].text.match(/<tools_update>[\s\S]*?<\/tools_update>/)
+  assert.ok(tuMatch, "resumed turn must emit <tools_update> when toolsSig changes")
+  assert.ok(tuMatch[0].includes("mcp_search"), "<tools_update> must include newly added tool schema")
+  assert.ok(tuMatch[0].includes('"limit":{"type":"integer"}'), "<tools_update> must include parameter schema of new tool")
+  assert.ok(tuMatch[0].includes("Removed client tools (no longer available): write_file"), "<tools_update> must list removed tools")
+  assert.ok(!tuMatch[0].includes("Read local file"), "<tools_update> should not redundantly resend unchanged read_file schema")
+
+  // Turn 3: same updated toolset -> no redundant <tools_update>
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [readTool, mcpTool],
+      messages: [
+        { role: "system", content: "Workspace agent" },
+        { role: "user", content: "Start auditing" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Now search docs with MCP" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Summarize findings" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
+  )
+  assert.equal(sentPayloads.length, 3)
+  assert.equal(sentPayloads[2].thread_id, tid)
+  assert.ok(!sentPayloads[2].text.includes("<tools_update>"), "unchanged toolset should not re-emit <tools_update>")
+
+  // Turn 4: all tools removed -> <tools_update> explicitly informs model tools are disabled
+  await executeSncsChat(
+    acct,
+    {
+      model: "balanced",
+      stream: false,
+      tools: [],
+      messages: [
+        { role: "system", content: "Workspace agent" },
+        { role: "user", content: "Start auditing" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Now search docs with MCP" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Summarize findings" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Answer directly without tools" },
+      ],
+    },
+    { WebSocket: MockWS, threadStore: store, sessionId: "sess-tools-1" },
+  )
+  assert.equal(sentPayloads.length, 4)
+  assert.equal(sentPayloads[3].thread_id, tid)
+  assert.match(sentPayloads[3].text, /<tools_update>[\s\S]*disabled[\s\S]*<\/tools_update>/)
+
+  // Large <tools_update> (50 verbose MCP tools added on resume -> > 62 KB raw) gets compacted cleanly by Stage 1 under 62 KB
+  const manyVerboseTools = Array.from({ length: 50 }, (_, i) => ({
+    type: "function",
+    function: {
+      name: `mcp_bulk_${i}`,
+      description: `Bulk MCP tool ${"D".repeat(500)} #${i}`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Long param doc ".repeat(40) },
+          mode: { type: "string", enum: ["fast", "deep"] },
+        },
+        required: ["query"],
+      },
+    },
+  }))
+  const compactResume = openaiToSncsRequest(
+    { model: "balanced", tools: [readTool, ...manyVerboseTools], messages: [{ role: "user", content: "ignored" }] },
+    {
+      resumeState: {
+        threadId: "thread-bulk-1",
+        workingSessionId: "ws-bulk-1",
+        toolsChanged: true,
+        prevToolMap: { read_file: "prev-hash" },
+        deltaMessages: [{ role: "user", content: "Use mcp_bulk_0" }],
+      },
+    },
+  )
+  const bulkBytes = buildAidpInputFrame({ type: "user_message", payload: compactResume.userMessagePayload }).byteLength
+  assert.ok(bulkBytes <= MAX_USER_MESSAGE_FRAME_BYTES, `compacted <tools_update> frame must be <= ${MAX_USER_MESSAGE_FRAME_BYTES}, got ${bulkBytes}`)
+  assert.ok(compactResume.userMessagePayload.text.includes("<tools_update>"))
+  assert.ok(compactResume.userMessagePayload.text.includes("mcp_bulk_0(query*: string"))
+})

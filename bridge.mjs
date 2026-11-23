@@ -384,9 +384,9 @@ function summarizeSchema(schema, depth = 0) {
   return String(schema.type || "any")
 }
 
-function formatToolsInstruction(tools, toolChoice, compact = false) {
-  if (!Array.isArray(tools) || tools.length === 0) return ""
-  const defs = tools
+function formatToolDefs(tools, compact = false) {
+  if (!Array.isArray(tools) || tools.length === 0) return []
+  return tools
     .map((t) => {
       const fn = t?.function ?? t
       if (!fn?.name) return null
@@ -402,13 +402,22 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
       return `- ${fn.name}(${sig})${desc ? `: ${desc}` : ""}`
     })
     .filter(Boolean)
-  if (!defs.length) return ""
-  let choiceNote = ""
-  if (toolChoice === "required") choiceNote = "\n- You MUST invoke at least one declared client tool in this turn."
-  else if (toolChoice === "none") choiceNote = "\n- Do NOT invoke any client tools in this turn."
-  else if (toolChoice && typeof toolChoice === "object" && toolChoice.function?.name) {
-    choiceNote = `\n- You MUST invoke the client tool "${toolChoice.function.name}" in this turn.`
+}
+
+function formatToolChoiceNote(toolChoice) {
+  if (toolChoice === "required") return "You MUST invoke at least one declared client tool in this turn."
+  if (toolChoice === "none") return "Do NOT invoke any client tools in this turn."
+  if (toolChoice && typeof toolChoice === "object" && toolChoice.function?.name) {
+    return `You MUST invoke the client tool "${toolChoice.function.name}" in this turn.`
   }
+  return ""
+}
+
+function formatToolsInstruction(tools, toolChoice, compact = false) {
+  const defs = formatToolDefs(tools, compact)
+  if (!defs.length) return ""
+  const choice = formatToolChoiceNote(toolChoice)
+  const choiceNote = choice ? `\n- ${choice}` : ""
   return [
     "CLIENT TOOL CALLING PROTOCOL (TEXT-STREAM BRIDGE):",
     "- Keep your AWS Quick assistant identity; you do not need to adopt another product's persona. Simply emit <tool_call> XML blocks in your text response whenever a local workspace operation is needed.",
@@ -420,6 +429,40 @@ function formatToolsInstruction(tools, toolChoice, compact = false) {
     "Declared client tools:",
     ...defs,
   ].join("\n")
+}
+
+function formatToolsUpdate(tools, toolChoice, prevToolMap, compact = false) {
+  const hasCurrent = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
+  if (!hasCurrent) {
+    return "Client tools have been disabled for this turn. Answer directly without emitting <tool_call> blocks."
+  }
+  const hasPrevMap = prevToolMap && typeof prevToolMap === "object" && Object.keys(prevToolMap).length > 0
+  if (!hasPrevMap) {
+    return formatToolsInstruction(tools, toolChoice, compact)
+  }
+  const curMap = toolDigestMap(tools)
+  const addedOrUpdated = tools.filter((t) => {
+    const fn = t?.function ?? t
+    return fn?.name && prevToolMap[fn.name] !== curMap[fn.name]
+  })
+  const removedNames = Object.keys(prevToolMap).filter((name) => !(name in curMap))
+  const lines = []
+  if (addedOrUpdated.length) {
+    lines.push(
+      'Added or updated client tools (invoke with <tool_call>{"name":"tool_name","arguments":{}}</tool_call>):',
+      ...formatToolDefs(addedOrUpdated, compact),
+    )
+  }
+  if (removedNames.length) {
+    lines.push(`Removed client tools (no longer available): ${removedNames.join(", ")}.`)
+  }
+  const choice = formatToolChoiceNote(toolChoice)
+  if (choice) {
+    lines.push(choice)
+  } else if (!lines.length) {
+    lines.push("Tool choice policy updated to auto; invoke any declared client tool as needed.")
+  }
+  return lines.join("\n")
 }
 
 export function normalizeClientSystemText(sysText) {
@@ -539,6 +582,17 @@ function messageDigest(msg) {
   const calls = role === "assistant" ? normalizeToolCallsForDigest(msg?.tool_calls) : []
   const callId = role === "tool" ? String(msg?.tool_call_id || msg?.name || "") : ""
   return sha256Hex(JSON.stringify([role, text, calls, callId]))
+}
+
+function toolDigestMap(tools) {
+  const out = {}
+  if (!Array.isArray(tools)) return out
+  for (const t of tools) {
+    const fn = t?.function ?? t
+    if (!fn?.name) continue
+    out[fn.name] = sha256Hex(JSON.stringify([fn.name, fn.description || "", canonicalJson(fn.parameters ?? {})]))
+  }
+  return out
 }
 
 function toolsDigest(tools, toolChoice) {
@@ -663,12 +717,15 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
             deltaStart--
           }
           const systemUpdate = systemDeltaText(entry.sysText || "", nextSysText || "")
+          const toolsChanged = entry.toolsSig !== toolsSig
           return {
             key: tcKey,
             threadId: entry.threadId,
             workingSessionId: entry.workingSessionId,
             deltaMessages: convoMessages.slice(deltaStart),
             systemUpdate,
+            toolsChanged,
+            prevToolMap: entry.toolMap || null,
             allHashes: hashes,
             toolsSig,
           }
@@ -702,12 +759,15 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
         }
         if (deltaStart >= convoMessages.length) continue
         const systemUpdate = systemDeltaText(entry.sysText || "", nextSysText || "")
+        const toolsChanged = entry.toolsSig !== toolsSig
         return {
           key: k,
           threadId: entry.threadId,
           workingSessionId: entry.workingSessionId,
           deltaMessages: convoMessages.slice(deltaStart),
           systemUpdate,
+          toolsChanged,
+          prevToolMap: entry.toolMap || null,
           allHashes: hashes,
           toolsSig,
         }
@@ -717,9 +777,9 @@ export function createThreadStore(maxEntries = THREAD_CACHE_MAX, ttlMs = THREAD_
     commit(accountKey, sessionId, state) {
       const now = Date.now()
       const record = { ...state, accountKey, updatedAt: now }
-      // Remove stale tool_call_id bindings for this threadId before registering new ones
+      // Remove stale tool_call_id and head bindings for this threadId before registering new ones
       for (const [k, v] of byKey) {
-        if (k.startsWith(`tc:${accountKey}|`) && v.threadId === record.threadId) {
+        if ((k.startsWith(`tc:${accountKey}|`) || k.startsWith(`head:${accountKey}|`)) && v.threadId === record.threadId) {
           byKey.delete(k)
         }
       }
@@ -788,16 +848,31 @@ export function openaiToSncsRequest(body, opts = {}) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
   const toolChoice = body?.tool_choice
   const hasTools = tools.length > 0 && toolChoice !== "none"
-  const toolsSig = toolsDigest(hasTools ? tools : [], toolChoice)
+  const activeTools = hasTools ? tools : []
+  const toolsSig = toolsDigest(activeTools, toolChoice)
+  const toolMap = toolDigestMap(activeTools)
   const rawSystemText = rawSystemParts.join("\n\n")
   const convoHashes = convoMessages.map(messageDigest)
 
   const resumeState = opts.resumeState || null
   const isResume = Boolean(resumeState?.threadId && Array.isArray(resumeState?.deltaMessages) && resumeState.deltaMessages.length)
+  const toolsChangedOnResume = isResume && Boolean(resumeState?.toolsChanged)
   const outboundMsgs = isResume ? resumeState.deltaMessages : convoMessages
   const hasToolResults = outboundMsgs.some((m) => String(m?.role || "").toLowerCase() === "tool")
-  const fullToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, false) : ""
-  const compactToolsPrompt = hasTools && !isResume ? formatToolsInstruction(tools, toolChoice, true) : ""
+  const fullToolsPrompt = !isResume
+    ? hasTools
+      ? formatToolsInstruction(tools, toolChoice, false)
+      : ""
+    : toolsChangedOnResume
+      ? formatToolsUpdate(activeTools, toolChoice, resumeState?.prevToolMap, false)
+      : ""
+  const compactToolsPrompt = !isResume
+    ? hasTools
+      ? formatToolsInstruction(tools, toolChoice, true)
+      : ""
+    : toolsChangedOnResume
+      ? formatToolsUpdate(activeTools, toolChoice, resumeState?.prevToolMap, true)
+      : ""
   const trailing = hasTools ? formatTrailingToolDirective(tools, toolChoice, hasToolResults) : ""
 
   let convoBlocks = formatConvoBlocks(outboundMsgs)
@@ -822,6 +897,9 @@ export function openaiToSncsRequest(body, opts = {}) {
     if (instrParts.length) parts.push(`<instructions>\n${instrParts.join("\n\n")}\n</instructions>`)
     if (isResume && resumeState.systemUpdate) {
       parts.push(`<system_context_update>\n${resumeState.systemUpdate}\n</system_context_update>`)
+    }
+    if (isResume && toolsText) {
+      parts.push(`<tools_update>\n${toolsText}\n</tools_update>`)
     }
     if (bodyText) parts.push(bodyText)
     if (trailing) parts.push(trailing)
@@ -871,8 +949,8 @@ export function openaiToSncsRequest(body, opts = {}) {
   let protectedStart = blocks.findIndex((b) => b.msgIndex > lastAssistantMsgIdx)
   if (protectedStart < 0) protectedStart = Math.max(0, blocks.length - 1)
 
-  // Stage 1: Compact verbose JSON tool schemas to concise typed signatures if over limit
-  if (!isResume && measure(text) > maxFrameBytes && hasTools) {
+  // Stage 1: Compact verbose JSON tool schemas (initial or resumed <tools_update>) to concise typed signatures if over limit
+  if (measure(text) > maxFrameBytes && compactToolsPrompt && toolsText !== compactToolsPrompt) {
     toolsText = compactToolsPrompt
     text = composeText(sysText, toolsText, blocks)
   }
@@ -988,6 +1066,7 @@ export function openaiToSncsRequest(body, opts = {}) {
     hasTools,
     isResume,
     toolsSig,
+    toolMap,
     rawSystemText,
     convoHashes,
     imageUrls: collectImageUrls(outboundMsgs),
@@ -1514,6 +1593,7 @@ async function runSncsTurn(a, openaiBody, ctx) {
         threadId: reqPlan.threadId,
         workingSessionId: reqPlan.workingSessionId,
         toolsSig: reqPlan.toolsSig,
+        toolMap: reqPlan.toolMap,
         sysText: reqPlan.rawSystemText,
         msgHashes: reqPlan.convoHashes,
         expectedAssistantSig,
